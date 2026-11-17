@@ -4,6 +4,8 @@
 // @version      1.0.0
 // @description  Adds "Play next" / "Play last" to YouTube's ⋮ menu. Own queue, saved queues, history. Kept in Violentmonkey/Tampermonkey storage.
 // @license      MIT
+// @homepageURL  https://github.com/Claire/youtube-shadow-queue
+// @supportURL   https://github.com/Claire/youtube-shadow-queue/issues
 // @author       Claire
 // @match        https://www.youtube.com/*
 // @run-at       document-idle
@@ -159,7 +161,9 @@
    * Choose the real title from a card's links to one video.
    * 1. A link's title attribute (YouTube puts the full title there).
    * 2. Otherwise the longest link text that isn't a badge ("New", "12:34").
-   * @param {{title?: string, textContent?: string}[]} links
+   * @param {{title?: string, textContent?: string}[]} links  the card's links to this video
+   * @param {string} id  the video's id (a title that's just the id doesn't count)
+   * @returns {string} the best title found, or the id if there's nothing better
    */
   function pickTitle(links, id) {
     const fromAttr = links.map((a) => (a.title || '').trim()).find((t) => !looksBadTitle(t, id));
@@ -218,9 +222,9 @@
     const cleanName = (n) => String(n || '').replace(/\s+/g, ' ').trim().slice(0, NAME_MAX);
     const findSaved = (all, n) => all.findIndex((q) => q.name.toLowerCase() === n.toLowerCase());
     const parseSaved = (text) => {
-      let raw = null;
-      try { raw = JSON.parse(text); } catch { /* unreadable → treat as none */ }
-      if (!Array.isArray(raw)) return [];
+      let raw;
+      try { raw = JSON.parse(text); } catch { return []; } // unreadable → treat as none
+      if (!Array.isArray(raw)) return []; // nothing saved yet (null) or not a list
       return raw
         .filter((q) => q && typeof q === 'object' && cleanName(q.name))
         .map((q) => ({

@@ -30,4 +30,4 @@ No tracking, analytics or third-party servers. Your data stays in your userscrip
 - After updating the script, reload open YouTube tabs.
 - Tested with Violentmonkey in Chromium-based browsers.
 
-Source, tests and issues: *(GitHub link)*
+Source, tests and issues: [github.com/Claire/youtube-shadow-queue](https://github.com/Claire/youtube-shadow-queue)

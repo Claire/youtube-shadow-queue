@@ -38,8 +38,9 @@ safe across browser restarts.
 
 1. Install a userscript manager: **[Violentmonkey](https://violentmonkey.github.io/)**
    (tested) or Tampermonkey.
-2. Install the script from **Greasy Fork** *(link coming)* or open
-   [`youtube-shadow-queue.user.js`](youtube-shadow-queue.user.js) here and click **Raw**.
+2. Install the script from **Greasy Fork** *(link coming)*, or straight from GitHub:
+   **[install youtube-shadow-queue.user.js](https://github.com/Claire/youtube-shadow-queue/raw/main/youtube-shadow-queue.user.js)**
+   (your userscript manager opens an install page).
 3. Reload any open YouTube tabs.
 
 > After updating the script, reload open YouTube tabs. Tabs that were already open
