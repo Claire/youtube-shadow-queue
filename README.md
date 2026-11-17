@@ -4,7 +4,7 @@ A userscript that gives desktop YouTube the queue controls the iPhone app has:
 **Play next** and **Play last**, plus a queue that remembers what you watched,
 saved queues you can reload, and playback that keeps Picture-in-Picture open.
 
-<!-- Add a real screenshot here: docs/screenshot.png -->
+![The queue panel next to YouTube, with two videos ticked and an "In queue · #1" badge on a hovered video](docs/screenshots/overview.png)
 
 ## Why
 
@@ -33,6 +33,18 @@ safe across browser restarts.
 - **Picture-in-Picture friendly:** the next video plays in the same floating window,
   like YouTube's own queue.
 - **Open tabs stay in sync.** Light and dark mode follow YouTube's theme.
+
+## Screenshots
+
+| Play next / Play last in the ⋮ menu | Played tab: fell asleep? |
+|---|---|
+| ![The ⋮ menu with Play next and Play last added at the top](docs/screenshots/menu.png) | ![Played tab with the "Back to where I dozed off" banner and 💤 videos](docs/screenshots/played.png) |
+| **Saved queues** | **Still watching?** |
+| ![Saved tab with a name box and saved queues, each with Replace, + Front and + End](docs/screenshots/saved.png) | ![The "Still watching?" prompt with a "Back to where I dozed off" button](docs/screenshots/still-watching.png) |
+| **Dark mode, auto-play off** | |
+| ![The panel in dark mode with auto-play switched off](docs/screenshots/dark-autoplay-off.png) | |
+
+<sub>Screenshots use sample videos.</sub>
 
 ## Install
 
