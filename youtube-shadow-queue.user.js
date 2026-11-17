@@ -4,6 +4,7 @@
 // @version      1.0.0
 // @description  Adds "Play next" / "Play last" to YouTube's ⋮ menu. Own queue, saved queues, history. Kept in Violentmonkey/Tampermonkey storage.
 // @license      MIT
+// @author       Claire
 // @match        https://www.youtube.com/*
 // @run-at       document-idle
 // @grant        GM_getValue
