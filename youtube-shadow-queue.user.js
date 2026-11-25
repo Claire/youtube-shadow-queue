@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         YouTube Shadow Queue
 // @namespace    local.youtube-shadow-queue
-// @version      1.0.0
+// @version      1.2.0
 // @description  Adds "Play next" / "Play last" to YouTube's ⋮ menu. Own queue, saved queues, history. Kept in Violentmonkey/Tampermonkey storage.
 // @license      MIT
 // @homepageURL  https://github.com/Claire/youtube-shadow-queue
@@ -13,6 +13,7 @@
 // @grant        GM_setValue
 // @grant        GM_deleteValue
 // @grant        GM_addValueChangeListener
+// @grant        unsafeWindow
 // @sandbox      JavaScript
 // @noframes
 // ==/UserScript==
@@ -30,6 +31,8 @@
  * Why the header asks for what it does:
  *   @grant GM_*        storage that belongs to the script, not to youtube.com,
  *                      plus a change listener so open tabs stay in sync.
+ *   @grant unsafeWindow reach YouTube's own page settings (ytcfg) for "Export to a
+ *                      YouTube playlist", whichever userscript manager runs us.
  *   @sandbox JavaScript (Tampermonkey) run where YouTube's own code can be reached,
  *                      so we can call its player (getVideoData / loadVideoById).
  *                      Violentmonkey's default injection mode already does this.
@@ -41,6 +44,8 @@
  *
  * Saved tab: "Save current queue" under a name. Load it later with
  * Replace, Add to front, or Add to end. Rename or delete saved queues there too.
+ * "Export" turns a saved queue into a real playlist on your YouTube account
+ * (Private by default), adding the videos one at a time with progress, pause and resume.
  *
  * Already queued? Hovering a video shows an "In queue · #3" badge, its ⋮ menu
  * offers "Remove from queue" instead, and it is never added twice.
@@ -84,6 +89,12 @@
   const SIZE_KEY = 'shadowQueue.size';          // panel size the user dragged to
   const DOZE_SEEN_KEY = 'shadowQueue.dozeSeen'; // remembers a dismissed 💤 banner
   const NAME_MAX = 60;                          // longest saved-queue name
+  const PLAYLIST_ID_RE = /^[\w-]{10,64}$/;      // YouTube playlist ids ("PL…"): letters, digits, _ and -
+  const PRIVACY = ['PRIVATE', 'UNLISTED', 'PUBLIC'];
+  const EXPORT_STATUSES = ['running', 'paused', 'done', 'error'];
+  const EXPORT_DELAY_MS = 1500;                 // pause between adding videos (YouTube limits fast adds)
+  const BACKUP_FORMAT = 'youtube-shadow-queue-backup'; // marks our backup files
+  const BACKUP_VERSION = 1;                     // bump if the backup layout ever changes
   const ID_RE = /^[\w-]{11}$/;        // every YouTube video ID is 11 chars of [A-Za-z0-9_-]
   const LINK_SEL = 'a[href*="/watch?v="], a[href^="/shorts/"]';
 
@@ -196,8 +207,8 @@
 
     const cleanPlayed = (v) => ({ ...clean(v), idle: v.idle === true, at: Number.isFinite(v.at) ? v.at : 0 });
 
-    const read = () => {
-      let raw = parse(KEY);
+    /** Turn any stored or imported queue object into a clean, valid one. */
+    const cleanState = (raw) => {
       if (!raw || typeof raw !== 'object' || Array.isArray(raw)) raw = {}; // nothing saved yet (or unreadable)
       const current = valid(raw.current) ? clean(raw.current) : null;
       const items = unique((Array.isArray(raw.items) ? raw.items : []).filter(valid).map(clean))
@@ -206,6 +217,7 @@
         .slice(-HISTORY_SIZE);
       return { current, items, played, paused: raw.paused === true };
     };
+    const read = () => cleanState(parse(KEY));
 
     const write = (s) => {
       const state = {
@@ -217,6 +229,25 @@
     };
 
     const update = (fn) => { const s = read(); fn(s); return write(s); };
+
+    /**
+     * Export-to-YouTube progress kept on a saved queue, so an export can resume after
+     * a page reload. Untrusted like everything in storage: anything odd → no progress.
+     */
+    const cleanExport = (e) => {
+      if (!e || typeof e !== 'object') return null;
+      const n = (x) => (Number.isInteger(x) && x >= 0 ? x : 0);
+      return {
+        playlistId: typeof e.playlistId === 'string' && PLAYLIST_ID_RE.test(e.playlistId) ? e.playlistId : null,
+        next: n(e.next),
+        added: n(e.added),
+        skipped: Array.isArray(e.skipped) ? e.skipped.filter((id) => ID_RE.test(id)) : [],
+        status: EXPORT_STATUSES.includes(e.status) ? e.status : 'paused',
+        error: typeof e.error === 'string' ? e.error.slice(0, 300) : '',
+        title: typeof e.title === 'string' ? e.title.slice(0, 150) : '',
+        privacy: PRIVACY.includes(e.privacy) ? e.privacy : 'PRIVATE',
+      };
+    };
 
     // Saved queues live under their own key, so the live queue stays small and fast.
     const cleanName = (n) => String(n || '').replace(/\s+/g, ' ').trim().slice(0, NAME_MAX);
@@ -232,6 +263,7 @@
           // +1 because a saved queue holds "now playing" plus a full "up next"
           items: unique((Array.isArray(q.items) ? q.items : []).filter(valid).map(clean)).slice(0, MAX_ITEMS + 1),
           at: Number.isFinite(q.at) ? q.at : 0,
+          exp: cleanExport(q.exp),
         }))
         .filter((q) => q.items.length);
     };
@@ -247,6 +279,28 @@
     };
     const writeSaved = (all) => {
       try { storage.setItem(SAVED_KEY, JSON.stringify(all)); } catch { /* storage blocked */ }
+    };
+
+    /** "Name (imported)", or "(imported 2)", "(imported 3)"… — whichever isn't taken yet. */
+    const freeName = (all, name) => {
+      for (let n = 1; ; n++) {
+        const suffix = n === 1 ? ' (imported)' : ` (imported ${n})`;
+        const candidate = cleanName(name.slice(0, NAME_MAX - suffix.length) + suffix);
+        if (findSaved(all, candidate) < 0) return candidate;
+      }
+    };
+
+    const inspect = (data) => {
+      if (!data || typeof data !== 'object' || data.format !== BACKUP_FORMAT) return { ok: false, reason: 'not-a-backup' };
+      if (!(Number.isInteger(data.version) && data.version >= 1)) return { ok: false, reason: 'not-a-backup' };
+      if (data.version > BACKUP_VERSION) return { ok: false, reason: 'newer' };
+      const queue = cleanState(data.queue);
+      const saved = parseSaved(JSON.stringify(Array.isArray(data.saved) ? data.saved : []));
+      const exportedAt = typeof data.exportedAt === 'string' && !Number.isNaN(Date.parse(data.exportedAt)) ? data.exportedAt : null;
+      return {
+        ok: true, queue, saved, exportedAt,
+        counts: { upNext: queue.items.length + (queue.current ? 1 : 0), played: queue.played.length, saved: saved.length },
+      };
     };
     const canAdd = (s, id) => positionIn(s, id) < 0 && s.items.length < MAX_ITEMS;
     /** Add to the end of history (newest). A re-watched video moves to the end instead of repeating. */
@@ -380,6 +434,70 @@
 
       clearHistory: () => update((s) => { s.played = []; }),
 
+      /* ---------- Backup & restore ---------- */
+
+      /** Everything worth keeping, as one plain object for a backup file. */
+      exportBackup: () => ({
+        format: BACKUP_FORMAT,
+        version: BACKUP_VERSION,
+        exportedAt: new Date().toISOString(),
+        queue: read(),
+        saved: readSaved(),
+      }),
+
+      /**
+       * Check a parsed backup file before using it. Everything in it is cleaned the
+       * same way as stored data, so a hand-edited or damaged file can't break anything.
+       * Returns { ok, queue, saved, exportedAt, counts } or { ok: false, reason }.
+       */
+      inspectBackup: (data) => inspect(data),
+
+      /**
+       * Bring a backup in.
+       *   'replace' → queue, history and saved queues become the backup's
+       *               (your auto-play setting is kept)
+       *   'merge'   → add what's missing: new videos go to the end of "up next"
+       *               (never past MAX_ITEMS), history is combined by date, and a saved
+       *               queue whose name exists with different videos comes in as "Name (imported)"
+       * Returns a summary of what happened, or { ok: false, reason }.
+       */
+      importBackup: (data, mode) => {
+        const b = inspect(data);
+        if (!b.ok) return b;
+        if (mode === 'replace') {
+          write({ ...b.queue, paused: read().paused });
+          writeSaved(b.saved);
+          return { ok: true, mode, ...b.counts };
+        }
+        const result = { ok: true, mode, added: 0, already: 0, skipped: 0, playedAdded: 0, savedAdded: 0, savedRenamed: 0 };
+        update((s) => {
+          const incoming = [...(b.queue.current ? [b.queue.current] : []), ...b.queue.items];
+          const fresh = incoming.filter((v) => positionIn(s, v.id) < 0);
+          const take = fresh.slice(0, Math.max(0, MAX_ITEMS - s.items.length));
+          s.items = [...s.items, ...take];
+          Object.assign(result, { added: take.length, already: incoming.length - fresh.length, skipped: fresh.length - take.length });
+          // History: one entry per video (the most recent ending wins), oldest → newest.
+          const byId = new Map(s.played.map((v) => [v.id, v]));
+          for (const v of b.queue.played) {
+            const mine = byId.get(v.id);
+            if (!mine) result.playedAdded++;
+            if (!mine || v.at > mine.at) byId.set(v.id, v);
+          }
+          s.played = [...byId.values()].sort((x, y) => x.at - y.at).slice(-HISTORY_SIZE);
+        });
+        const all = readSaved();
+        const sameVideos = (x, y) => x.items.length === y.items.length && x.items.every((v, i) => v.id === y.items[i].id);
+        for (const q of b.saved) {
+          const i = findSaved(all, q.name);
+          if (i < 0) { all.push(q); result.savedAdded++; continue; }
+          if (sameVideos(all[i], q)) continue; // identical copy: nothing to do
+          all.push({ ...q, name: freeName(all, q.name), exp: null });
+          result.savedRenamed++;
+        }
+        writeSaved(all);
+        return result;
+      },
+
       /** Auto-play switch. paused = true → the queue waits when a video ends. */
       setPaused: (paused) => update((s) => { s.paused = !!paused; }),
 
@@ -402,7 +520,7 @@
         const all = readSaved();
         const i = findSaved(all, n);
         if (i >= 0 && !overwrite) return { ok: false, reason: 'exists' };
-        const entry = { name: n, items: list, at: Date.now() };
+        const entry = { name: n, items: list, at: Date.now(), exp: null }; // new contents → any old export no longer matches
         if (i >= 0) all[i] = entry; else all.push(entry);
         writeSaved(all);
         return { ok: true, count: list.length };
@@ -462,6 +580,16 @@
         return { ok: true };
       },
 
+      /** Store (or clear, with null) a saved queue's export progress. */
+      setExport: (name, exp) => {
+        const all = readSaved();
+        const i = findSaved(all, cleanName(name));
+        if (i < 0) return false;
+        all[i] = { ...all[i], exp: exp ? cleanExport(exp) : null };
+        writeSaved(all);
+        return true;
+      },
+
       deleteSaved: (name) => {
         const all = readSaved();
         const i = findSaved(all, cleanName(name));
@@ -471,11 +599,175 @@
     };
   }
 
+  /* ----------------------------------------------------------------------
+   * Export a saved queue to a real YouTube playlist.
+   *
+   * YouTube has no simple official way for a userscript to create playlists, so
+   * we send the same requests youtube.com itself sends when you click
+   * Save → New playlist, using your own signed-in session. This approach (create
+   * once, add one at a time, back off, skip unavailable videos) follows the
+   * open-source "channel-to-playlist" extension by Hubert Gavin (MIT):
+   * https://github.com/hubert2gavin/channel-to-playlist
+   *
+   * This part is pure: the network call (`api`) and waiting (`sleep`) are passed
+   * in, so it can be tested without YouTube.
+   * -------------------------------------------------------------------- */
+
+  /** Sort a YouTube API reply into: ok | retry (busy/limited) | video (skip it) | auth | hard. */
+  function classifyApi(r) {
+    const j = r.json || {};
+    if (r.status >= 200 && r.status < 300 && j.status === 'STATUS_SUCCEEDED') return 'ok';
+    if (r.status === 0 || r.status === 429 || r.status >= 500) return 'retry';
+    const text = apiErrorText(r).toLowerCase();
+    if (/quota|rate|too many|try again later/.test(text)) return 'retry';
+    if (r.status === 401 || r.status === 403 || /sign in|unauthenticated|login/.test(text)) return 'auth';
+    if (r.status === 400 || r.status === 404 || j.status === 'STATUS_FAILED' || /unavailable|not found|invalid/.test(text)) return 'video';
+    return 'hard';
+  }
+
+  function apiErrorText(r) {
+    if (r.error) return String(r.error);
+    const j = r.json || {};
+    return String((j.error && (j.error.message || j.error.status)) || `HTTP ${r.status}`).slice(0, 200);
+  }
+
+  const playlistIdFrom = (j) => {
+    const id = j && (j.playlistId || (j.playlist && j.playlist.playlistId));
+    return typeof id === 'string' && PLAYLIST_ID_RE.test(id) ? id : null;
+  };
+
+  /**
+   * Create the playlist (once) and add the videos one at a time, from progress.next.
+   * Progress is reported after every step, so a reload can resume where it stopped.
+   *
+   * @param {object} o
+   * @param {string[]} o.videoIds     the saved queue, in order
+   * @param {string} o.title
+   * @param {'PRIVATE'|'UNLISTED'|'PUBLIC'} o.privacy
+   * @param {object} [o.progress]     { playlistId, next, added, skipped } from an earlier run
+   * @param {(path: string, body: object) => Promise<{status: number, json?: object, error?: string}>} o.api
+   * @param {(ms: number) => Promise<void>} o.sleep
+   * @param {(p: object) => void} [o.onProgress]
+   * @param {() => boolean} [o.shouldStop]   true → pause after the current step
+   * @param {() => number} [o.random]
+   * @returns {Promise<object>} progress plus status: 'done' | 'paused' | 'error' (with error text)
+   */
+  async function runExport(o) {
+    const random = o.random || Math.random;
+    const shouldStop = o.shouldStop || (() => false);
+    const p = { playlistId: null, next: 0, added: 0, skipped: [], ...(o.progress || {}) };
+    const report = (status, error = '') => {
+      const out = { ...p, skipped: p.skipped.slice(), status, error, title: o.title, privacy: o.privacy };
+      o.onProgress?.(out);
+      return out;
+    };
+
+    // Busy or rate-limited → wait and try again, a little longer each time (with jitter
+    // so retries don't line up). Gives up after 5 tries; the user can Resume later.
+    const withRetry = async (call) => {
+      for (let attempt = 0; ; attempt++) {
+        const r = await call();
+        const kind = classifyApi(r);
+        if (kind !== 'retry' || attempt >= 4) return { r, kind };
+        if (shouldStop()) return { r, kind: 'stopped' };
+        await o.sleep(Math.min(60000, 2000 * 2 ** attempt) * (1 + random() * 0.3));
+      }
+    };
+    const stopMessage = (kind, r) => (kind === 'auth'
+      ? 'YouTube says you are not signed in. Sign in, reload the page, then Resume.'
+      : kind === 'retry'
+        ? 'YouTube is limiting requests right now. Try Resume later (it may be a daily limit).'
+        : `YouTube refused the request: ${apiErrorText(r)}`);
+
+    if (!o.videoIds.length) return report('error', 'This saved queue is empty.');
+
+    if (!p.playlistId) {
+      const body = { title: o.title, privacyStatus: o.privacy, videoIds: [] };
+      let { r, kind } = await withRetry(() => o.api('/youtubei/v1/playlist/create', body));
+      if (kind === 'stopped') return report('paused');
+      p.playlistId = playlistIdFrom(r.json);
+      if (!p.playlistId && kind !== 'auth') {
+        // Some accounts only accept a new playlist with a first video in it.
+        ({ r, kind } = await withRetry(() => o.api('/youtubei/v1/playlist/create', { ...body, videoIds: [o.videoIds[0]] })));
+        p.playlistId = playlistIdFrom(r.json);
+        if (p.playlistId) { p.next = 1; p.added = 1; }
+      }
+      if (!p.playlistId) return report('error', stopMessage(kind === 'ok' ? 'hard' : kind, r));
+      report('running');
+    }
+
+    while (p.next < o.videoIds.length) {
+      if (shouldStop()) return report('paused');
+      const videoId = o.videoIds[p.next];
+      const { r, kind } = await withRetry(() => o.api('/youtubei/v1/browse/edit_playlist', {
+        playlistId: p.playlistId,
+        actions: [{ action: 'ACTION_ADD_VIDEO', addedVideoId: videoId }],
+      }));
+      if (kind === 'stopped') return report('paused');
+      if (kind === 'ok') p.added++;
+      else if (kind === 'video') p.skipped.push(videoId); // deleted, private, or region-blocked
+      else return report('error', stopMessage(kind, r));
+      p.next++;
+      report('running');
+      if (p.next < o.videoIds.length) await o.sleep(EXPORT_DELAY_MS * (0.8 + random() * 0.6));
+    }
+    return report('done');
+  }
+
+  /**
+   * The Authorization value youtube.com sends with its own API requests: a SHA-1 of
+   * a timestamp, your SAPISID login cookie and the site address. The cookie itself
+   * is never sent anywhere; only this hash goes to youtube.com, as YouTube does.
+   * Two forms exist; newer accounts prefix your sync id and end with "_u".
+   */
+  async function sapisidHash(sapisid, origin, ts, userId, subtle = globalThis.crypto.subtle) {
+    const text = userId ? [userId, ts, sapisid, origin].join(' ') : `${ts} ${sapisid} ${origin}`;
+    const digest = await subtle.digest('SHA-1', new TextEncoder().encode(text));
+    const hex = [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, '0')).join('');
+    return userId ? `${ts}_${hex}_u` : `${ts}_${hex}`;
+  }
+
+  /** Build the Authorization header from cookies (null if not signed in). */
+  async function youtubeAuthHeader(cookies, origin, ts, userId) {
+    const main = cookies.SAPISID || cookies['__Secure-3PAPISID'];
+    if (!main) return null;
+    const parts = [`SAPISIDHASH ${await sapisidHash(main, origin, ts, userId)}`];
+    if (cookies['__Secure-1PAPISID']) parts.push(`SAPISID1PHASH ${await sapisidHash(cookies['__Secure-1PAPISID'], origin, ts, userId)}`);
+    if (cookies['__Secure-3PAPISID']) parts.push(`SAPISID3PHASH ${await sapisidHash(cookies['__Secure-3PAPISID'], origin, ts, userId)}`);
+    return parts.join(' ');
+  }
+
+  /**
+   * A spreadsheet-friendly list (CSV) of everything in a backup: one row per video.
+   * Opens in Numbers, Excel or Google Sheets.
+   */
+  function backupToCsv(backup) {
+    // Why the apostrophe: a cell starting with = + - or @ would run as a formula in
+    // spreadsheet apps. A leading ' makes it plain text (a video title can't run code).
+    const cell = (value) => {
+      let t = String(value ?? '');
+      if (/^[=+\-@\t\r]/.test(t)) t = `'${t}`;
+      return /[",\r\n]/.test(t) ? `"${t.replace(/"/g, '""')}"` : t;
+    };
+    const url = (id) => `https://www.youtube.com/watch?v=${id}`;
+    const rows = [['list', 'position', 'title', 'url', 'ended', 'no_activity']];
+    const q = backup.queue;
+    if (q.current) rows.push(['Now playing', 0, q.current.title, url(q.current.id), '', '']);
+    q.items.forEach((v, i) => rows.push(['Up next', i + 1, v.title, url(v.id), '', '']));
+    q.played.slice().reverse().forEach((v, i) => rows.push([
+      'Played', i + 1, v.title, url(v.id), v.at ? new Date(v.at).toISOString() : '', v.idle ? 'yes' : 'no',
+    ]));
+    for (const sq of backup.saved) sq.items.forEach((v, i) => rows.push([`Saved: ${sq.name}`, i + 1, v.title, url(v.id), '', '']));
+    // \ufeff (byte-order mark) tells Excel the file is UTF-8, so emoji and accents show correctly.
+    return `\ufeff${rows.map((r) => r.map(cell).join(',')).join('\r\n')}\r\n`;
+  }
+
   // In Node (tests) we only export the pure logic. In the browser we start the UI.
   if (typeof window === 'undefined') {
     module.exports = {
       createStore, moveBlock, moveEdge, idFromHref, positionIn, sleepStartIn, looksBadTitle, pickTitle,
-      KEY, SAVED_KEY, SIZE_KEY, DOZE_SEEN_KEY, MAX_ITEMS, HISTORY_SIZE, NAME_MAX,
+      runExport, classifyApi, sapisidHash, youtubeAuthHeader, backupToCsv, BACKUP_FORMAT,
+      KEY, SAVED_KEY, SIZE_KEY, DOZE_SEEN_KEY, MAX_ITEMS, HISTORY_SIZE, NAME_MAX, EXPORT_DELAY_MS,
     };
     return;
   }
@@ -498,6 +790,81 @@
   const storage = gmStorage || local;
   const store = createStore(storage);
 
+  /* ---------- YouTube API requests (used only by "Export to a YouTube playlist") ----------
+   * The same kind of request youtube.com sends when you click Save → New playlist.
+   * It goes only to youtube.com, with your own session, and only when you start an export. */
+  const pageWin = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
+  const YT_ORIGIN = 'https://www.youtube.com';
+
+  /** YouTube's own page settings (client version, session index…), or undefined. */
+  function ytcfgGet(key) {
+    try {
+      const c = pageWin.ytcfg;
+      return c && (typeof c.get === 'function' ? c.get(key) : c.data_ && c.data_[key]);
+    } catch { return undefined; }
+  }
+
+  function readCookies() {
+    const out = {};
+    for (const part of String(document.cookie || '').split(';')) {
+      const i = part.indexOf('=');
+      if (i > 0) out[part.slice(0, i).trim()] = part.slice(i + 1).trim();
+    }
+    return out;
+  }
+
+  /** Why an export can't start right now, or '' if it can. */
+  function exportBlocker() {
+    if (!ytcfgGet('INNERTUBE_CONTEXT')) return 'YouTube page data not found. Reload the page, then try again.';
+    const c = readCookies();
+    if (!c.SAPISID && !c['__Secure-3PAPISID']) return 'Sign in to YouTube first, then try again.';
+    return '';
+  }
+
+  // Which of the two login-hash forms this account accepts; learned on the first success.
+  let authMode = null;
+
+  async function youtubeCall(path, body, mode) {
+    const context = ytcfgGet('INNERTUBE_CONTEXT');
+    const syncId = ytcfgGet('DATASYNC_ID');
+    const userId = mode === 'u' && syncId ? String(syncId).split('||')[0] : null;
+    const auth = await youtubeAuthHeader(readCookies(), YT_ORIGIN, Math.floor(Date.now() / 1000), userId);
+    if (!context || !auth) return { status: 401, error: 'Not signed in' };
+    const headers = {
+      'Content-Type': 'application/json',
+      Authorization: auth,
+      'X-Origin': YT_ORIGIN,
+      'X-Goog-AuthUser': String(ytcfgGet('SESSION_INDEX') ?? '0'),
+      'X-Youtube-Client-Name': String(ytcfgGet('INNERTUBE_CONTEXT_CLIENT_NAME') ?? '1'),
+      'X-Youtube-Client-Version': String(ytcfgGet('INNERTUBE_CLIENT_VERSION') || context.client?.clientVersion || ''),
+    };
+    const visitor = context.client?.visitorData || ytcfgGet('VISITOR_DATA');
+    if (visitor) headers['X-Goog-Visitor-Id'] = visitor;
+    const pageId = ytcfgGet('DELEGATED_SESSION_ID'); // set when using a brand account / channel
+    if (pageId) headers['X-Goog-PageId'] = pageId;
+    try {
+      const res = await fetch(`${path}?prettyPrint=false`, {
+        method: 'POST', credentials: 'include', headers, body: JSON.stringify({ context, ...body }),
+      });
+      let json = null;
+      try { json = await res.json(); } catch { /* not JSON */ }
+      return { status: res.status, json };
+    } catch (e) {
+      return { status: 0, error: String(e?.message || e) }; // offline etc. → retried
+    }
+  }
+
+  /** Try the newer login-hash form first (if this account has a sync id), then the older one. */
+  async function youtubeApi(path, body) {
+    const modes = authMode ? [authMode] : ytcfgGet('DATASYNC_ID') ? ['u', 'legacy'] : ['legacy'];
+    let last;
+    for (const mode of modes) {
+      last = await youtubeCall(path, body, mode);
+      if (last.status !== 401 && last.status !== 403) { authMode = mode; return last; }
+    }
+    return last;
+  }
+
   /* ---------- Tiny DOM helpers ----------
    * We never use innerHTML: YouTube enforces Trusted Types, and textContent
    * also makes injected titles harmless (no XSS). */
@@ -519,8 +886,13 @@
     replay: 'M12 5V1L7 6l5 5V7c3.31 0 6 2.69 6 6s-2.69 6-6 6-6-2.69-6-6H4c0 4.42 3.58 8 8 8s8-3.58 8-8-3.58-8-8-8z',
     check: 'M9 16.17 4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41z',
     edit: 'M3 17.25V21h3.75L17.81 9.94l-3.75-3.75L3 17.25zM20.71 7.04a1 1 0 0 0 0-1.41l-2.34-2.34a1 1 0 0 0-1.41 0l-1.83 1.83 3.75 3.75 1.83-1.83z',
+    playlistAdd: 'M14 10H2v2h12v-2zm0-4H2v2h12V6zm4 8v-4h-2v4h-4v2h4v4h2v-4h4v-2h-4zM2 16h8v-2H2v2z',
+    open: 'M19 19H5V5h7V3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14c1.1 0 2-.9 2-2v-7h-2v7zM14 3v2h3.59l-9.83 9.83 1.41 1.41L19 6.41V10h2V3h-7z',
     save: 'M17 3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V7l-4-4zm-5 16a3 3 0 1 1 0-6 3 3 0 0 1 0 6zm3-10H5V5h10v4z',
     trash: 'M6 19c0 1.1.9 2 2 2h8c1.1 0 2-.9 2-2V7H6v12zM19 4h-3.5l-1-1h-5l-1 1H5v2h14V4z',
+    download: 'M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z',
+    upload: 'M9 16h6v-6h4l-7-7-7 7h4zm-4 2h14v2H5z',
+    table: 'M10 10.02h5V21h-5zM17 21h3c1.1 0 2-.9 2-2v-9h-5v11zm3-18H5c-1.1 0-2 .9-2 2v3h19V5c0-1.1-.9-2-2-2zM3 19c0 1.1.9 2 2 2h3V10H3v9z',
   };
   const SVG_NS = 'http://www.w3.org/2000/svg';
   const icon = (name) => {
@@ -952,6 +1324,9 @@
   let renaming = null;        // saved queue whose name is being edited
   let renameDraft = '';       // what's typed so far — survives panel refreshes while typing
   let renameFresh = false;    // true right after "Rename" is clicked: select the whole name once
+  let exportForm = null;      // saved queue whose "Export to YouTube" form is open
+  let exportDraft = { title: '', privacy: 'PRIVATE' }; // the form's values, kept across redraws
+  let exporting = null;       // { name, stop } while an export runs (one at a time)
   let deleteArmed = null;     // saved queue waiting for the second "delete" tap
   let replaceArmed = null;    // saved queue waiting for the second "replace" tap
   let overwriteArmed = null;  // name waiting for the second "save" tap (replaces the old one)
@@ -1081,11 +1456,34 @@
     ui.list = el('ol', 'sq-list');
     ui.empty = el('div', 'sq-empty');
 
-    ui.clear = el('button', 'sq-text-btn', 'Clear all');
+    ui.clear = el('button', 'sq-text-btn sq-clear', 'Clear all');
     ui.clear.type = 'button';
     ui.clear.addEventListener('click', onClear);
+    // Backup & restore: files on your computer, nothing leaves the browser.
+    ui.fileInput = el('input');
+    ui.fileInput.type = 'file';
+    ui.fileInput.accept = 'application/json,.json';
+    ui.fileInput.hidden = true;
+    ui.fileInput.addEventListener('change', onImportFile);
+    const backupTools = el('div', 'sq-foot-tools');
+    // Words as well as icons: the download arrow looks a lot like "move to bottom".
+    const labeled = (name, label, title, onClick) => {
+      const b = el('button', 'sq-text-btn sq-labeled');
+      b.type = 'button';
+      b.title = title;
+      b.setAttribute('aria-label', title);
+      b.append(icon(name), el('span', null, label));
+      b.addEventListener('click', onClick);
+      return b;
+    };
+    backupTools.append(
+      labeled('download', 'Backup', 'Download a backup (.json): queue, history and saved queues', downloadBackup),
+      labeled('table', 'CSV', 'Download a list for spreadsheets (.csv)', downloadCsv),
+      labeled('upload', 'Import', 'Import a backup (.json)', () => { ui.fileInput.value = ''; ui.fileInput.click(); }),
+      ui.fileInput,
+    );
     const foot = el('footer', 'sq-foot');
-    foot.append(ui.clear);
+    foot.append(backupTools, ui.clear);
 
     ui.folder = el('div', 'sq-folder'); // the folder body the selected tab joins onto
     ui.folder.append(ui.tools, ui.savebar, ui.list, ui.empty);
@@ -1101,6 +1499,35 @@
     ui.toast.setAttribute('role', 'status');
 
     // "Still watching?" prompt
+    // Import dialog: what's in the file, then Merge / Replace / Cancel
+    ui.importBox = el('div', 'sq-theme sq-prompt sq-import');
+    ui.importBox.hidden = true;
+    ui.importBox.setAttribute('role', 'dialog');
+    ui.importBox.setAttribute('aria-label', 'Import a backup');
+    ui.importBox.addEventListener('keydown', (e) => { if (e.key === 'Escape') hideImport(); });
+    ui.importInfo = el('p', 'sq-prompt-p');
+    ui.importCounts = el('div', 'sq-import-counts');
+    ui.importMerge = el('button', 'sq-big-btn is-primary', 'Merge');
+    ui.importMerge.type = 'button';
+    ui.importMerge.title = 'Add what you don\'t have yet; keep everything you have';
+    ui.importMerge.addEventListener('click', () => doImport('merge'));
+    ui.importReplace = el('button', 'sq-big-btn');
+    ui.importReplace.type = 'button';
+    ui.importReplace.title = 'Your queue, history and saved queues become the backup\'s';
+    ui.importReplace.addEventListener('click', () => doImport('replace'));
+    const importCancel = el('button', 'sq-big-btn', 'Cancel');
+    importCancel.type = 'button';
+    importCancel.addEventListener('click', hideImport);
+    const importBtns = el('div', 'sq-prompt-btns');
+    importBtns.append(importCancel, ui.importReplace, ui.importMerge);
+    ui.importBox.append(
+      el('div', 'sq-prompt-h', 'Import a backup'),
+      ui.importInfo,
+      ui.importCounts,
+      el('p', 'sq-prompt-p', 'Merge adds what you don\'t have yet. Replace all makes everything match the backup.'),
+      importBtns,
+    );
+
     ui.prompt = el('div', 'sq-theme sq-prompt');
     ui.prompt.hidden = true;
     ui.prompt.setAttribute('role', 'dialog');
@@ -1129,6 +1556,99 @@
     const text = el('span', 'sq-rewind-text');
     text.append(el('b', null, 'Back to where I dozed off'), el('span', 'sq-rewind-title', start.video.title));
     return [icon('replay'), text];
+  }
+
+  /* ---------- Backup & restore ---------- */
+
+  /** Save text as a file in the browser's Downloads (no permission needed). */
+  function saveFile(name, text, type) {
+    const url = URL.createObjectURL(new Blob([text], { type }));
+    const a = el('a');
+    a.href = url;
+    a.download = name;
+    document.body.append(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 10000); // give the download time to start
+  }
+
+  const today = () => {
+    const d = new Date();
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+  };
+
+  function downloadBackup() {
+    const b = store.exportBackup();
+    saveFile(`youtube-queue-backup-${today()}.json`, JSON.stringify(b, null, 2), 'application/json');
+    toast(`Backup downloaded: ${plural(b.queue.items.length + (b.queue.current ? 1 : 0))} up next, ${b.saved.length} saved queues`);
+  }
+
+  function downloadCsv() {
+    saveFile(`youtube-queue-${today()}.csv`, backupToCsv(store.exportBackup()), 'text/csv');
+    toast('List downloaded (.csv): opens in Numbers, Excel or Google Sheets');
+  }
+
+  const MAX_IMPORT_BYTES = 20 * 1024 * 1024; // far above any real backup; stops a wrong huge file freezing the page
+  let pendingImport = null; // the parsed backup waiting for Merge / Replace
+
+  async function onImportFile() {
+    const file = ui.fileInput.files?.[0];
+    if (!file) return;
+    if (file.size > MAX_IMPORT_BYTES) { toast('That file is too big to be a queue backup.'); return; }
+    let data;
+    try { data = JSON.parse(await file.text()); } catch { toast("That file isn't a queue backup (not readable)."); return; }
+    const check = store.inspectBackup(data);
+    if (!check.ok) {
+      toast(check.reason === 'newer'
+        ? 'That backup is from a newer version of the script. Update the script, then import it.'
+        : "That file isn't a queue backup from this script.");
+      return;
+    }
+    pendingImport = data;
+    showImport(file.name, check);
+  }
+
+  function showImport(fileName, check) {
+    const c = check.counts;
+    const when = check.exportedAt
+      ? new Date(check.exportedAt).toLocaleString([], { dateStyle: 'medium', timeStyle: 'short' })
+      : 'unknown date';
+    ui.importInfo.textContent = `${fileName} · ${when}`;
+    ui.importCounts.textContent = `${plural(c.upNext)} up next · ${c.played} played · ${c.saved} saved ${c.saved === 1 ? 'queue' : 'queues'}`;
+    ui.importReplace.textContent = 'Replace all';
+    ui.importReplace.classList.remove('is-armed');
+    ui.importBox.hidden = false;
+    ui.importMerge.focus();
+  }
+
+  function hideImport() {
+    pendingImport = null;
+    ui.importBox.hidden = true;
+  }
+
+  function doImport(mode) {
+    // Replace wipes what you have, so it takes two clicks.
+    if (mode === 'replace' && !ui.importReplace.classList.contains('is-armed')) {
+      ui.importReplace.classList.add('is-armed');
+      ui.importReplace.textContent = 'Click again to replace';
+      return;
+    }
+    const r = store.importBackup(pendingImport, mode);
+    hideImport();
+    selected.clear();
+    render();
+    if (!r.ok) { toast("That backup couldn't be read."); return; }
+    if (mode === 'replace') {
+      toast(`Restored: ${plural(r.upNext)} up next, ${r.played} played, ${r.saved} saved queues`);
+      return;
+    }
+    const parts = [`Added ${plural(r.added)}`];
+    if (r.already) parts.push(`${r.already} already queued`);
+    if (r.skipped) parts.push(`${r.skipped} didn't fit (queue full)`);
+    if (r.playedAdded) parts.push(`${r.playedAdded} to history`);
+    if (r.savedAdded) parts.push(`${r.savedAdded} saved queues`);
+    if (r.savedRenamed) parts.push(`${r.savedRenamed} saved as "(imported)"`);
+    toast(parts.join(' · '));
   }
 
   function showPrompt(v) {
@@ -1301,6 +1821,10 @@
   function onSaveQueue() {
     const name = ui.saveName.value.replace(/\s+/g, ' ').trim();
     const overwrite = !!overwriteArmed && overwriteArmed.toLowerCase() === name.toLowerCase();
+    if (exporting && exporting.name.toLowerCase() === name.toLowerCase()) {
+      toast(`"${exporting.name}" is being exported. Pause the export first.`);
+      return;
+    }
     const r = store.saveAs(name, { overwrite });
     if (!r.ok) {
       if (r.reason === 'noname') { toast('Type a name first'); ui.saveName.focus(); return; }
@@ -1344,6 +1868,150 @@
     render();
   }
 
+  /* ---------- Export a saved queue to a YouTube playlist ---------- */
+  const PRIVACY_LABEL = { PRIVATE: 'Private', UNLISTED: 'Unlisted', PUBLIC: 'Public' };
+  const playlistUrl = (id) => `https://www.youtube.com/playlist?list=${id}`; // id was validated
+  const minutes = (videos) => Math.max(1, Math.round((videos * EXPORT_DELAY_MS) / 60000));
+
+  function openExportForm(q) {
+    if (exporting && exporting.name !== q.name) { toast('One export at a time: wait for it to finish, or pause it.'); return; }
+    exportForm = q.name;
+    exportDraft = { title: q.name, privacy: 'PRIVATE' };
+    deleteArmed = replaceArmed = null;
+    render();
+  }
+
+  /**
+   * Start an export. fresh = true (the form): always a NEW playlist.
+   * fresh = false (Resume / Try again): continue the playlist in q.exp if there is one.
+   */
+  async function startExport(q, { title, privacy, fresh }) {
+    if (exporting) { toast('One export at a time: wait for it to finish, or pause it.'); return; }
+    const blocker = exportBlocker();
+    if (blocker) { toast(blocker); return; }
+    const resume = !fresh && q.exp && q.exp.status !== 'done' && q.exp.playlistId ? q.exp : null;
+    const job = { name: q.name, stop: false };
+    exporting = job;
+    exportForm = null;
+    store.setExport(q.name, { ...(resume || { playlistId: null, next: 0, added: 0, skipped: [] }), status: 'running', error: '', title, privacy });
+    render();
+    const result = await runExport({
+      videoIds: q.items.map((v) => v.id),
+      title,
+      privacy,
+      progress: resume,
+      api: youtubeApi,
+      sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
+      onProgress: (p) => { store.setExport(job.name, p); render(); },
+      shouldStop: () => job.stop,
+    });
+    exporting = null;
+    render();
+    if (result.status === 'done') {
+      const extra = result.skipped.length ? ` · ${result.skipped.length} unavailable skipped` : '';
+      toast(`Playlist ready: "${title}" (${plural(result.added)})${extra}`);
+    } else if (result.status === 'paused') toast('Export paused. Resume any time.');
+    else toast(result.error);
+  }
+
+  /** The export area under a saved queue: form, progress, or result. */
+  function exportArea(q) {
+    const box = el('div', 'sq-export');
+    const total = q.items.length;
+    const active = exporting?.name === q.name;
+
+    if (exportForm === q.name && !active) {
+      const title = el('input', 'sq-input');
+      title.type = 'text';
+      title.maxLength = 150;
+      title.value = exportDraft.title;
+      title.setAttribute('aria-label', 'Playlist title');
+      title.addEventListener('input', () => { exportDraft.title = title.value; });
+      title.addEventListener('keydown', (e) => e.stopPropagation()); // typing must not trigger YouTube shortcuts
+
+      const privacy = el('select', 'sq-select');
+      privacy.setAttribute('aria-label', 'Playlist privacy');
+      for (const v of PRIVACY) {
+        const opt = el('option', null, PRIVACY_LABEL[v]);
+        opt.value = v;
+        opt.selected = v === exportDraft.privacy;
+        privacy.append(opt);
+      }
+      privacy.addEventListener('change', () => { exportDraft.privacy = privacy.value; });
+
+      const go = el('button', 'sq-save-btn');
+      go.type = 'button';
+      go.append(icon('playlistAdd'), el('span', null, 'Create playlist'));
+      go.addEventListener('click', () => {
+        const t = exportDraft.title.replace(/\s+/g, ' ').trim();
+        if (!t) { toast('Give the playlist a title first'); title.focus(); return; }
+        startExport(q, { title: t, privacy: exportDraft.privacy, fresh: true });
+      });
+      const cancel = el('button', 'sq-load-btn', 'Cancel');
+      cancel.type = 'button';
+      cancel.addEventListener('click', () => { exportForm = null; render(); });
+
+      const row1 = el('div', 'sq-export-row');
+      row1.append(title, privacy);
+      const row2 = el('div', 'sq-export-row');
+      row2.append(cancel, go);
+      box.append(
+        el('div', 'sq-export-h', 'Export to a YouTube playlist'),
+        row1,
+        el('div', 'sq-meta', `Adds ${plural(total)} to a new playlist on your signed-in YouTube account, one at a time (about ${minutes(total)} min).`),
+        row2,
+      );
+      return box;
+    }
+
+    const e = q.exp;
+    if (!e) return null;
+    const done = e.added + e.skipped.length;
+    const shown = active ? 'running' : e.status === 'running' ? 'paused' : e.status; // a reload stops a run
+    const bar = el('div', 'sq-progress');
+    const fill = el('div', 'sq-progress-fill');
+    fill.style.width = `${Math.round((100 * Math.min(done, total)) / Math.max(1, total))}%`;
+    bar.append(fill);
+
+    const skipped = e.skipped.length ? ` · ${e.skipped.length} unavailable skipped` : '';
+    const text = {
+      running: `Adding ${Math.min(done + 1, total)} of ${total}…${skipped}`,
+      paused: `Paused at ${done} of ${total}${skipped}`,
+      error: e.error || 'The export stopped.',
+      done: `✓ Exported ${e.added} of ${total} to "${e.title}" (${PRIVACY_LABEL[e.privacy]})${skipped}`,
+    }[shown];
+    box.classList.add(`is-${shown}`);
+
+    const actions = el('div', 'sq-export-row');
+    const button = (label, onClick, cls = 'sq-load-btn') => {
+      const b = el('button', cls, label);
+      b.type = 'button';
+      b.addEventListener('click', onClick);
+      return b;
+    };
+    if (shown === 'running') actions.append(button('Pause', () => { exporting.stop = true; toast('Pausing after this video…'); }));
+    if (shown === 'paused' || shown === 'error') {
+      actions.append(button(e.playlistId ? 'Resume' : 'Try again', () => startExport(q, { title: e.title || q.name, privacy: e.privacy, fresh: false })));
+    }
+    if (e.playlistId) {
+      const a = el('a', 'sq-load-btn sq-open');
+      a.href = playlistUrl(e.playlistId);
+      a.target = '_blank';
+      a.rel = 'noopener';
+      a.append(icon('open'), el('span', null, 'Open playlist'));
+      actions.append(a);
+    }
+    if (!active) {
+      // Forget = hide this progress. The playlist (if any) stays on YouTube.
+      actions.append(iconBtn('close', e.playlistId ? 'Hide (the playlist stays on YouTube)' : 'Hide', () => {
+        store.setExport(q.name, null);
+        render();
+      }));
+    }
+    box.append(el('div', 'sq-export-text', text), ...(shown === 'done' ? [] : [bar]), actions);
+    return box;
+  }
+
   function savedRow(q) {
     const li = el('li', 'sq-row sq-saved');
     const body = el('div', 'sq-row-body');
@@ -1377,7 +2045,9 @@
       body.append(el('div', 'sq-saved-name', q.name), el('div', 'sq-meta', `${plural(q.items.length)}${day ? ` · saved ${day}` : ''}`));
     }
 
+    const busy = exporting?.name === q.name;
     const del = iconBtn('trash', deleteArmed === q.name ? 'Click again to delete' : 'Delete', () => {
+      if (busy) { toast('Pause the export before deleting this queue.'); return; }
       if (deleteArmed !== q.name) {
         armTwoTap(() => { deleteArmed = q.name; replaceArmed = null; });
         toast(`Click the trash again to delete "${q.name}"`);
@@ -1389,6 +2059,7 @@
       toast(`Deleted "${q.name}"`);
     }, deleteArmed === q.name ? 'sq-danger is-armed' : 'sq-danger');
     const ren = iconBtn('edit', 'Rename', () => {
+      if (busy) { toast('Pause the export before renaming this queue.'); return; }
       renaming = q.name;
       renameDraft = q.name;
       renameFresh = true;
@@ -1408,7 +2079,9 @@
       loadBtn('+ Front', 'front'),
       loadBtn('+ End', 'end'),
     );
-    li.append(body, ren, del, loads);
+    const exp = iconBtn('playlistAdd', 'Export to a YouTube playlist', () => openExportForm(q));
+    const area = exportArea(q);
+    li.append(body, exp, ren, del, loads, ...(area ? [area] : []));
     return li;
   }
 
@@ -1818,10 +2491,26 @@
                    box-shadow: 0 6px 14px rgba(123, 92, 255, .35); font-family: inherit; font-size: .9375em; font-weight: 700; }
     .sq-save-btn svg { width: 18px; height: 18px; fill: currentColor; }
     .sq-save-btn.is-armed { background: var(--sq-a2); }
-    .sq-saved { grid-template-columns: 1fr auto auto; row-gap: 10px; }
+    .sq-saved { grid-template-columns: 1fr auto auto auto; row-gap: 10px; }
+    .sq-export { grid-column: 1 / -1; display: flex; flex-direction: column; gap: 10px; padding: 12px; border-radius: 14px;
+                 background: var(--sq-bg); box-shadow: var(--sq-inset); }
+    .sq-export-h { font-weight: 800; }
+    .sq-export-row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+    .sq-export-row .sq-input { flex: 1 1 180px; }
+    .sq-export-row .sq-save-btn { margin-left: auto; }
+    .sq-export-text { font-weight: 600; }
+    .sq-export.is-error .sq-export-text { color: var(--sq-a2); }
+    .sq-export.is-done .sq-export-text { color: var(--sq-a1); }
+    .sq-select { padding: 10px 12px; border: 0; border-radius: 12px; cursor: pointer; background: var(--sq-bg);
+                 box-shadow: var(--sq-raised-sm); color: var(--sq-text); font-family: inherit; font-size: .9375em; font-weight: 700; }
+    .sq-progress { height: 10px; border-radius: 5px; overflow: hidden; background: var(--sq-lo); }
+    .sq-progress-fill { height: 100%; border-radius: 5px; background: var(--sq-grad); transition: width .3s; }
+    .sq-export.is-paused .sq-progress-fill { background: var(--sq-muted); }
+    .sq-open { display: inline-flex; align-items: center; gap: 6px; text-decoration: none; }
+    .sq-open svg { width: 16px; height: 16px; fill: currentColor; }
     .sq-saved-name { font-weight: 700; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .sq-load { grid-column: 1 / -1; display: flex; gap: 8px; }
-    .sq-load-btn { flex: 1; padding: 8px 10px; border: 0; border-radius: 12px; cursor: pointer; white-space: nowrap;
+    .sq-load-btn { flex: 1 1 auto; padding: 8px 10px; border: 0; border-radius: 12px; cursor: pointer; white-space: nowrap;
                    background: var(--sq-bg); box-shadow: var(--sq-raised-sm); color: var(--sq-text);
                    font-family: inherit; font-size: .875em; font-weight: 700; }
     .sq-load-btn:hover { color: var(--sq-a1); }
@@ -1864,7 +2553,14 @@
     .sq-big-btn:active { transform: scale(.97); }
 
     .sq-empty { padding: 24px 12px; text-align: center; font-size: .875em; color: var(--sq-muted); }
-    .sq-foot { display: flex; justify-content: flex-end; padding-top: 12px; }
+    .sq-foot { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding-top: 12px; }
+    .sq-foot-tools { display: flex; gap: 6px; flex-wrap: wrap; }
+    .sq-text-btn.sq-labeled { display: inline-flex; align-items: center; gap: 4px; padding: 8px 10px; color: var(--sq-text); }
+    .sq-labeled svg { width: 18px; height: 18px; fill: currentColor; }
+    .sq-text-btn.sq-labeled:hover { color: var(--sq-a1); }
+    .sq-import-counts { margin: 0 0 6px; padding: 12px 14px; border-radius: 14px; box-shadow: var(--sq-inset); font-weight: 700; }
+    .sq-import .sq-prompt-btns { flex-wrap: wrap; }
+    .sq-big-btn.is-armed { color: #fff; background: var(--sq-a2); box-shadow: none; }
     .sq-text-btn { padding: 8px 14px; border: 0; border-radius: 12px; cursor: pointer;
                    background: var(--sq-bg); box-shadow: var(--sq-raised-sm); color: var(--sq-muted);
                    font-family: inherit; font-size: .875em; font-weight: 700; }
@@ -1899,7 +2595,7 @@
   buildPanel();
   applySize(savedSize());
   document.head.append(el('style', null, CSS));
-  document.body.append(ui.root, ui.pill, ui.toast, ui.prompt);
+  document.body.append(ui.root, ui.pill, ui.toast, ui.prompt, ui.importBox);
   render();
 
   repairTitles();

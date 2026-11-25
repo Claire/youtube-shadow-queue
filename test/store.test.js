@@ -1,7 +1,10 @@
 // Unit tests for the queue logic. Run with:  npm test
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { createStore, SAVED_KEY, idFromHref, looksBadTitle, pickTitle, KEY, MAX_ITEMS, HISTORY_SIZE } = require('../youtube-shadow-queue.user.js');
+const {
+  createStore, SAVED_KEY, idFromHref, looksBadTitle, pickTitle, KEY, MAX_ITEMS, HISTORY_SIZE,
+  runExport, classifyApi, sapisidHash, youtubeAuthHeader, backupToCsv, BACKUP_FORMAT,
+} = require('../youtube-shadow-queue.user.js');
 
 // A fake localStorage, so tests don't need a browser.
 const fakeStorage = () => {
@@ -471,4 +474,278 @@ test('saved queues: changes from another tab are seen right away; returned lists
   // changing a returned list must not change what the store sees next
   s.listSaved().length = 0;
   assert.equal(s.listSaved().length, 1);
+});
+
+
+/* ---------------- Export to a YouTube playlist ---------------- */
+
+const PL = 'PLabcdefghij1234567890';
+const ok = (extra = {}) => ({ status: 200, json: { status: 'STATUS_SUCCEEDED', ...extra } });
+
+/**
+ * A fake YouTube API. `script` maps a call number (1-based) to a reply; anything
+ * not listed succeeds. Records every call.
+ */
+function fakeApi(script = {}) {
+  const calls = [];
+  const api = async (path, body) => {
+    calls.push({ path, body });
+    const reply = script[calls.length];
+    if (reply) return typeof reply === 'function' ? reply(path, body) : reply;
+    return path.endsWith('/playlist/create') ? ok({ playlistId: PL }) : ok();
+  };
+  return { api, calls };
+}
+const noSleep = async () => {};
+const vids = (s) => [...s].map((c) => c.repeat(11));
+
+test('export: creates a private playlist, then adds every video in order', async () => {
+  const { api, calls } = fakeApi();
+  const seen = [];
+  const r = await runExport({ videoIds: vids('ABC'), title: 'Cabin', privacy: 'PRIVATE', api, sleep: noSleep, onProgress: (p) => seen.push(`${p.next} ${p.status}`) });
+  assert.equal(r.status, 'done');
+  assert.equal(r.playlistId, PL);
+  assert.equal(r.added, 3);
+  assert.deepEqual(calls[0], { path: '/youtubei/v1/playlist/create', body: { title: 'Cabin', privacyStatus: 'PRIVATE', videoIds: [] } });
+  assert.deepEqual(calls.slice(1).map((c) => c.body.actions[0].addedVideoId), vids('ABC'));
+  assert.ok(calls.slice(1).every((c) => c.path === '/youtubei/v1/browse/edit_playlist' && c.body.playlistId === PL));
+  assert.deepEqual(seen, ['0 running', '1 running', '2 running', '3 running', '3 done'], 'progress after create, after each video, then done');
+});
+
+test('export: waits between videos so YouTube is not flooded', async () => {
+  const waits = [];
+  await runExport({ videoIds: vids('ABC'), title: 't', privacy: 'PRIVATE', api: fakeApi().api, sleep: async (ms) => waits.push(ms), random: () => 0.5 });
+  assert.equal(waits.length, 2, 'between videos, not after the last');
+  assert.ok(waits.every((ms) => ms >= 1000 && ms <= 2200));
+});
+
+test('export: busy / rate-limited → retries with growing waits, then continues', async () => {
+  const { api, calls } = fakeApi({ 2: { status: 429, json: {} }, 3: { status: 503, json: {} } });
+  const waits = [];
+  const r = await runExport({ videoIds: vids('AB'), title: 't', privacy: 'PRIVATE', api, sleep: async (ms) => waits.push(ms), random: () => 0 });
+  assert.equal(r.status, 'done');
+  assert.equal(r.added, 2);
+  assert.equal(calls.filter((c) => c.body.actions?.[0].addedVideoId === vids('A')[0]).length, 3, 'A tried 3 times');
+  assert.deepEqual(waits.slice(0, 2), [2000, 4000]);
+});
+
+test('export: still limited after 5 tries → stops with a "try later" message, progress kept', async () => {
+  const limited = { status: 429, json: {} };
+  const { api } = fakeApi({ 3: limited, 4: limited, 5: limited, 6: limited, 7: limited });
+  const r = await runExport({ videoIds: vids('ABC'), title: 't', privacy: 'PRIVATE', api, sleep: noSleep });
+  assert.equal(r.status, 'error');
+  assert.match(r.error, /limiting requests/);
+  assert.equal(r.next, 1, 'A was added; stopped at B');
+  assert.equal(r.added, 1);
+});
+
+test('export: unavailable videos are skipped and listed', async () => {
+  const { api } = fakeApi({ 3: { status: 200, json: { status: 'STATUS_FAILED' } } });
+  const r = await runExport({ videoIds: vids('ABC'), title: 't', privacy: 'PRIVATE', api, sleep: noSleep });
+  assert.equal(r.status, 'done');
+  assert.equal(r.added, 2);
+  assert.deepEqual(r.skipped, vids('B'));
+});
+
+test('export: signed out → stops with a sign-in message', async () => {
+  const { api, calls } = fakeApi({ 1: { status: 401, json: { error: { message: 'Unauthenticated' } } } });
+  const r = await runExport({ videoIds: vids('AB'), title: 't', privacy: 'PRIVATE', api, sleep: noSleep });
+  assert.equal(r.status, 'error');
+  assert.match(r.error, /not signed in/);
+  assert.equal(calls.length, 1, 'no second create attempt when signed out');
+});
+
+test('export: if an empty playlist is refused, creates it with the first video', async () => {
+  const { api, calls } = fakeApi({ 1: { status: 400, json: { error: { message: 'Invalid request' } } } });
+  const r = await runExport({ videoIds: vids('ABC'), title: 't', privacy: 'UNLISTED', api, sleep: noSleep });
+  assert.equal(r.status, 'done');
+  assert.deepEqual(calls[1].body.videoIds, vids('A'));
+  assert.equal(calls[1].body.privacyStatus, 'UNLISTED');
+  assert.deepEqual(calls.slice(2).map((c) => c.body.actions[0].addedVideoId), vids('BC'), 'A not added twice');
+  assert.equal(r.added, 3);
+});
+
+test('export: pause and resume pick up exactly where it stopped', async () => {
+  let stop = false;
+  const first = fakeApi();
+  const paused = await runExport({
+    videoIds: vids('ABCD'), title: 't', privacy: 'PRIVATE', api: first.api, sleep: noSleep,
+    onProgress: (p) => { if (p.next === 2) stop = true; }, shouldStop: () => stop,
+  });
+  assert.equal(paused.status, 'paused');
+  assert.equal(paused.next, 2);
+  const second = fakeApi();
+  const done = await runExport({ videoIds: vids('ABCD'), title: 't', privacy: 'PRIVATE', api: second.api, sleep: noSleep, progress: paused });
+  assert.equal(done.status, 'done');
+  assert.equal(done.added, 4);
+  assert.equal(second.calls[0].path, '/youtubei/v1/browse/edit_playlist', 'no new playlist on resume');
+  assert.deepEqual(second.calls.map((c) => c.body.actions[0].addedVideoId), vids('CD'));
+});
+
+test('classifyApi sorts replies', () => {
+  assert.equal(classifyApi(ok()), 'ok');
+  assert.equal(classifyApi({ status: 200, json: {} }), 'hard', '200 without success flag is not ok');
+  assert.equal(classifyApi({ status: 0, error: 'offline' }), 'retry');
+  assert.equal(classifyApi({ status: 200, json: { error: { message: 'Quota exceeded' } } }), 'retry');
+  assert.equal(classifyApi({ status: 403, json: {} }), 'auth');
+  assert.equal(classifyApi({ status: 404, json: {} }), 'video');
+});
+
+test('sapisidHash: both forms, and the header lists every cookie variant', async () => {
+  // SHA-1("1700000000 abc https://www.youtube.com"), computed independently below
+  const expected = require('node:crypto').createHash('sha1').update('1700000000 abc https://www.youtube.com').digest('hex');
+  assert.equal(await sapisidHash('abc', 'https://www.youtube.com', 1700000000), `1700000000_${expected}`);
+  const withUser = require('node:crypto').createHash('sha1').update('42 1700000000 abc https://www.youtube.com').digest('hex');
+  assert.equal(await sapisidHash('abc', 'https://www.youtube.com', 1700000000, '42'), `1700000000_${withUser}_u`);
+  const h = await youtubeAuthHeader({ SAPISID: 'a', '__Secure-1PAPISID': 'b', '__Secure-3PAPISID': 'c' }, 'https://www.youtube.com', 1);
+  assert.match(h, /^SAPISIDHASH 1_[0-9a-f]{40} SAPISID1PHASH 1_[0-9a-f]{40} SAPISID3PHASH 1_[0-9a-f]{40}$/);
+  assert.equal(await youtubeAuthHeader({}, 'https://www.youtube.com', 1), null, 'signed out → no header');
+});
+
+test('saved queues keep export progress; rename keeps it, saving over clears it, junk is ignored', () => {
+  const storage = fakeStorage();
+  const s = createStore(storage);
+  s.playLast(A);
+  s.saveAs('mix');
+  assert.equal(s.listSaved()[0].exp, null);
+  s.setExport('mix', { playlistId: PL, next: 1, added: 1, skipped: [], status: 'running', privacy: 'PRIVATE', title: 'mix' });
+  assert.equal(s.listSaved()[0].exp.playlistId, PL);
+  s.renameSaved('mix', 'Mix 2');
+  assert.equal(s.listSaved()[0].exp.next, 1, 'progress follows the rename');
+  s.saveAs('mix 2', { overwrite: true });
+  assert.equal(s.listSaved()[0].exp, null, 'new contents → old export no longer applies');
+  storage.setItem(SAVED_KEY, JSON.stringify([{ name: 'x', items: [A], exp: { playlistId: 'bad id!', next: -3, skipped: ['nope', A.id], status: 'weird', privacy: 'SECRET' } }]));
+  const e = createStore(storage).listSaved()[0].exp;
+  assert.deepEqual([e.playlistId, e.next, e.skipped, e.status, e.privacy], [null, 0, [A.id], 'paused', 'PRIVATE']);
+  assert.equal(s.setExport('missing', {}), false);
+});
+
+
+/* ---------------- Backup & restore ---------------- */
+
+/** A store with: E now playing, A B up next, C D played (D newest), and one saved queue. */
+function storeWithEverything(storage = fakeStorage()) {
+  const s = createStore(storage);
+  const E = vid('E');
+  [C, D, E, A, B].forEach(s.playLast);
+  s.advance('xxxxxxxxxxx'); s.advance(C.id); s.advance(D.id, { idle: true }); // C, D played; E now playing
+  s.saveAs('Mix');
+  return s;
+}
+// JSON round trip, like writing the file and reading it back
+const viaFile = (o) => JSON.parse(JSON.stringify(o));
+
+test('backup: contains queue, history and saved queues, marked as ours', () => {
+  const b = storeWithEverything().exportBackup();
+  assert.equal(b.format, BACKUP_FORMAT);
+  assert.equal(b.version, 1);
+  assert.ok(!Number.isNaN(Date.parse(b.exportedAt)));
+  assert.equal(b.queue.current.id, 'EEEEEEEEEEE');
+  assert.equal(ids(b.queue), 'AB');
+  assert.deepEqual(b.queue.played.map((v) => v.id[0]), ['C', 'D']);
+  assert.equal(b.queue.played[1].idle, true);
+  assert.deepEqual(b.saved.map((q) => q.name), ['Mix']);
+});
+
+test('restore (replace): a fresh browser gets back exactly what was backed up', () => {
+  const backup = viaFile(storeWithEverything().exportBackup());
+  const fresh = createStore(fakeStorage());
+  fresh.setPaused(true);
+  const r = fresh.importBackup(backup, 'replace');
+  assert.deepEqual(r, { ok: true, mode: 'replace', upNext: 3, played: 2, saved: 1 });
+  const st = fresh.get();
+  assert.equal(st.current.id, 'EEEEEEEEEEE');
+  assert.equal(ids(st), 'AB');
+  assert.equal(st.played.length, 2);
+  assert.equal(st.paused, true, 'your auto-play setting is kept');
+  assert.equal(fresh.listSaved()[0].items.length, 3);
+});
+
+test('restore (merge): adds only what is missing, keeps what you have', () => {
+  const backup = viaFile(storeWithEverything().exportBackup());
+  const s = createStore(fakeStorage());
+  [B, vid('F')].forEach(s.playLast);                       // B is also in the backup
+  const r = s.importBackup(backup, 'merge');
+  assert.equal(r.ok, true);
+  assert.deepEqual([r.added, r.already, r.skipped], [2, 1, 0]); // E and A new, B already there
+  assert.equal(ids(s.get()), 'BFEA', 'yours first, backup videos appended in order');
+  assert.equal(r.playedAdded, 2);
+  assert.equal(r.savedAdded, 1);
+  assert.deepEqual(s.listSaved().map((q) => q.name), ['Mix'], 'the saved queue really arrived');
+  assert.equal(s.listSaved()[0].items.length, 3);
+});
+
+test('restore (merge): history combines by date; same video keeps its latest end', () => {
+  const backup = viaFile(storeWithEverything().exportBackup());
+  const s = createStore(fakeStorage());
+  s.playLast(C); s.advance('xxxxxxxxxxx'); s.advance(C.id);  // C ended just now (later than in the backup)
+  const mineAt = s.get().played[0].at;
+  backup.queue.played[0].at = mineAt - 100000;              // backup's C ended earlier
+  backup.queue.played[1].at = mineAt - 50000;               // backup's D ended in between
+  s.importBackup(backup, 'merge');
+  const played = s.get().played;
+  assert.deepEqual(played.map((v) => v.id[0]), ['D', 'C'], 'oldest → newest');
+  assert.equal(played.find((v) => v.id[0] === 'C').at, mineAt, 'kept the later ending');
+});
+
+test('restore (merge): saved queue name clashes', () => {
+  const backup = viaFile(storeWithEverything().exportBackup());
+  const s = createStore(fakeStorage());
+  s.playLast(A); s.saveAs('mix');                           // same name, different videos
+  let r = s.importBackup(backup, 'merge');
+  assert.equal(r.savedRenamed, 1);
+  assert.deepEqual(s.listSaved().map((q) => q.name).sort(), ['Mix (imported)', 'mix']);
+  r = s.importBackup(backup, 'merge');                      // again: another clash
+  assert.deepEqual(s.listSaved().map((q) => q.name).sort(), ['Mix (imported 2)', 'Mix (imported)', 'mix']);
+  const same = createStore(fakeStorage());
+  same.importBackup(backup, 'replace');
+  r = same.importBackup(backup, 'merge');                   // identical copy → nothing added
+  assert.deepEqual([r.savedAdded, r.savedRenamed], [0, 0]);
+  assert.equal(same.listSaved().length, 1);
+});
+
+test('restore (merge): respects the queue limit and reports what did not fit', () => {
+  const backup = viaFile(storeWithEverything().exportBackup());
+  const s = createStore(fakeStorage());
+  for (let i = 0; i < MAX_ITEMS - 1; i++) s.playLast({ id: String(i).padStart(11, '0') });
+  const r = s.importBackup(backup, 'merge');
+  assert.deepEqual([r.added, r.skipped], [1, 2]);
+  assert.equal(s.get().items.length, MAX_ITEMS);
+});
+
+test('restore: rejects files that are not our backups, or from a newer version', () => {
+  const s = createStore(fakeStorage());
+  for (const junk of [null, 42, 'text', [], {}, { format: 'something-else', version: 1 }, { format: BACKUP_FORMAT }]) {
+    assert.deepEqual(s.importBackup(junk, 'replace'), { ok: false, reason: 'not-a-backup' });
+  }
+  assert.deepEqual(s.importBackup({ format: BACKUP_FORMAT, version: 99 }, 'merge'), { ok: false, reason: 'newer' });
+  assert.deepEqual(s.get(), { current: null, items: [], played: [], paused: false }, 'nothing changed');
+});
+
+test('restore: damaged or hand-edited contents are cleaned, never trusted', () => {
+  const s = createStore(fakeStorage());
+  const r = s.importBackup({
+    format: BACKUP_FORMAT, version: 1, exportedAt: 'not a date',
+    queue: { current: { id: '<script>' }, items: [A, A, { id: 'bad' }, 'junk'], played: 'nope' },
+    saved: [{ name: '', items: [A] }, { name: 'ok', items: [A, { id: 'x' }] }, 7],
+  }, 'replace');
+  assert.deepEqual(r, { ok: true, mode: 'replace', upNext: 1, played: 0, saved: 1 });
+  assert.equal(s.get().current, null);
+  assert.equal(ids(s.get()), 'A');
+  assert.equal(s.inspectBackup({ format: BACKUP_FORMAT, version: 1, exportedAt: 'nope' }).exportedAt, null);
+});
+
+test('CSV: one row per video, safe for spreadsheets', () => {
+  const s = storeWithEverything();
+  s.playLast({ id: 'GGGGGGGGGGG', title: '=HYPERLINK("http://evil")' });
+  s.playLast({ id: 'HHHHHHHHHHH', title: 'Commas, "quotes"\nand lines' });
+  const csv = backupToCsv(s.exportBackup());
+  assert.ok(csv.startsWith('﻿list,position,title,url,ended,no_activity\r\n'));
+  const lines = csv.slice(1).trim().split('\r\n');
+  assert.equal(lines[1], 'Now playing,0,E,https://www.youtube.com/watch?v=EEEEEEEEEEE,,');
+  assert.equal(lines[2], 'Up next,1,A,https://www.youtube.com/watch?v=AAAAAAAAAAA,,');
+  assert.ok(lines.some((l) => l.startsWith(`Up next,3,"'=HYPERLINK(""http://evil"")"`)), 'formula neutralised');
+  assert.ok(csv.includes('"Commas, ""quotes""\nand lines"'), 'commas, quotes and newlines escaped');
+  assert.ok(lines.some((l) => /^Played,1,D,.*,\d{4}-\d\d-\d\dT.*,yes$/.test(l)), 'newest played first, with time and 💤');
+  assert.equal(lines.filter((l) => l.startsWith('Saved: Mix,')).length, 3);
 });

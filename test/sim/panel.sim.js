@@ -162,7 +162,7 @@ const click = (n, opts = {}) => n.dispatchEvent(new window.MouseEvent('click', {
   assert.equal(state().current.id, A, 'queue untouched by history edits');
   click(qa('.sq-played .sq-check')[1]); // untick
   assert.equal(q('.sq-selectall span').textContent, 'Select all');
-  assert.equal(q('.sq-text-btn').textContent, 'Clear history');
+  assert.equal(q('.sq-clear').textContent, 'Clear history');
   click(prows[1].querySelector('.sq-from-btn')); // fell asleep during B
   assert.equal(state().current.id, B);
   assert.deepEqual(state().items.map((v) => v.id), [C, A]);
@@ -171,9 +171,9 @@ const click = (n, opts = {}) => n.dispatchEvent(new window.MouseEvent('click', {
   assert.equal(qa('.sq-row:not(.sq-played)').length, 2, 'back on Up next');
 
   // 6. Clear needs two taps
-  click(q('.sq-text-btn'));
+  click(q('.sq-clear'));
   assert.ok(state().current);
-  click(q('.sq-text-btn'));
+  click(q('.sq-clear'));
   assert.equal(state().current, null);
   assert.equal(q('.sq-panel').hidden, true);
 

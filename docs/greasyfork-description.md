@@ -16,11 +16,15 @@ YouTube's desktop "Add to queue" always adds to the end. This script adds its ow
 - **Up next:** checkboxes (Shift-click for a range), move to top / up / down / bottom, remove, clear
 - **Played:** finished videos with the time they ended; reorder, remove, **Play from here**
 - **Saved:** save the queue under a name, then load it with **Replace**, **+ Front** or **+ End**
+- **Export to a YouTube playlist:** turn a saved queue into a real playlist on your account (Private by default), with progress, pause and resume
+- **Backup & restore:** download a `.json` backup or a `.csv` list for spreadsheets; **Import** with **Merge** or **Replace all**
 - **Auto-play switch** (or **Option+P**): off = watch anything, the queue waits
 - Resizable, remembers its size, follows YouTube's light/dark theme, large readable text
 
 ![Saved queues](https://github.com/Claire/youtube-shadow-queue/blob/main/docs/screenshots/saved.png?raw=true)
+![Export to a YouTube playlist](https://github.com/Claire/youtube-shadow-queue/blob/main/docs/screenshots/export.png?raw=true)
 ![Dark mode with auto-play off](https://github.com/Claire/youtube-shadow-queue/blob/main/docs/screenshots/dark-autoplay-off.png?raw=true)
+![Import a backup](https://github.com/Claire/youtube-shadow-queue/blob/main/docs/screenshots/import.png?raw=true)
 
 ### Fell asleep?
 Videos that played with no mouse or keyboard use get a 💤. **Back to where I dozed off** rewinds to the first one in one click. After 2 untouched videos in a row, the queue pauses and asks **Still watching?** (adjustable).
@@ -32,7 +36,9 @@ Videos that played with no mouse or keyboard use get a 💤. **Back to where I d
 Edit the block at the top of the script: queue size, text size, history length, the "Still watching?" count, and in-place switching.
 
 ### Privacy
-No tracking, analytics or third-party servers. Your data stays in your userscript manager's storage. The only requests go to YouTube itself: titles from youtube.com/oembed (no cookies sent) and thumbnails from i.ytimg.com.
+No tracking, analytics or third-party servers. Your data stays in your userscript manager's storage. The only requests go to YouTube itself: titles from youtube.com/oembed (no cookies sent) and thumbnails from i.ytimg.com. Backup and CSV files are made in your browser and saved to your own computer; nothing is uploaded.
+
+**Export to a YouTube playlist** (only when you click it) uses your own signed-in YouTube session and sends the same requests youtube.com sends for *Save → New playlist*, including a hash made from your login cookie, as YouTube's page does. The cookie itself is never sent, and nothing goes anywhere but youtube.com. This uses YouTube's undocumented internal API, so it may stop working if YouTube changes it.
 
 ### Notes
 - Desktop www.youtube.com only.

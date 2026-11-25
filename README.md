@@ -28,6 +28,12 @@ safe across browser restarts.
   After 2 untouched videos in a row it pauses and asks **Still watching?**
 - **Saved tab:** save the queue under a name; load it later with
   **Replace**, **+ Front** or **+ End**. Rename and delete too.
+- **Export to a YouTube playlist:** turn a saved queue into a real playlist on your
+  account (Private, Unlisted or Public). Videos are added one at a time with a
+  progress bar; pause and resume any time, even after a reload.
+- **Backup & restore:** download everything as a `.json` file, or a `.csv` list for
+  spreadsheets. **Import** a backup with **Merge** (adds only what you don't have) or
+  **Replace all**. Good for moving to another browser or computer.
 - **Auto-play switch** (or **Option+P**): turn it off to watch anything without the
   queue jumping in; turn it back on to resume.
 - **Picture-in-Picture friendly:** the next video plays in the same floating window,
@@ -41,8 +47,10 @@ safe across browser restarts.
 | ![The ⋮ menu with Play next and Play last added at the top](docs/screenshots/menu.png) | ![Played tab with the "Back to where I dozed off" banner and 💤 videos](docs/screenshots/played.png) |
 | **Saved queues** | **Still watching?** |
 | ![Saved tab with a name box and saved queues, each with Replace, + Front and + End](docs/screenshots/saved.png) | ![The "Still watching?" prompt with a "Back to where I dozed off" button](docs/screenshots/still-watching.png) |
-| **Dark mode, auto-play off** | |
-| ![The panel in dark mode with auto-play switched off](docs/screenshots/dark-autoplay-off.png) | |
+| **Export to a YouTube playlist** | **Dark mode, auto-play off** |
+| ![A finished export with an Open playlist button, and the export form with title and privacy](docs/screenshots/export.png) | ![The panel in dark mode with auto-play switched off](docs/screenshots/dark-autoplay-off.png) |
+| **Import a backup: Merge or Replace all** | |
+| ![The import dialog showing what the backup holds, with Cancel, Replace all and Merge](docs/screenshots/import.png) | |
 
 <sub>Screenshots use sample videos.</sub>
 
@@ -75,8 +83,15 @@ Open the script in your userscript manager and edit the block at the top:
 - No tracking, no analytics, no accounts, no third-party servers.
 - Your queue, history and saved queues stay in your userscript manager's storage
   on your computer (Violentmonkey: the script's **Values** tab).
+- **Backup** and **CSV** files are made in your browser and saved to your own
+  Downloads folder; **Import** reads a file you pick. Nothing is uploaded.
 - The only network requests go to YouTube itself: video titles from
   `youtube.com/oembed` (sent without cookies) and thumbnails from `i.ytimg.com`.
+- **Export to a YouTube playlist** (only when you click it) uses your own signed-in
+  YouTube session, sending the same requests youtube.com sends when you click
+  *Save → New playlist*. To prove it's you, it sends a hash made from your YouTube login
+  cookie, exactly as YouTube's own page does. The cookie itself is never sent, and
+  nothing goes anywhere but youtube.com.
 
 ## Limitations
 
@@ -86,6 +101,11 @@ Open the script in your userscript manager and edit the block at the top:
 - YouTube changes its page often. If the ⋮ menu items disappear, Option+N / Option+L
   still work, and the menu selectors are in one list near the top of the menu code.
 - Tested with Violentmonkey in Chromium-based browsers (including Crest).
+- **Export** uses YouTube's internal web API, which isn't officially documented and can
+  change without notice. If it stops working you'll see a clear message; nothing else
+  in the script is affected. YouTube also seems to limit how many videos an account can
+  add per day: if an export stops with a "limiting requests" message, press **Resume**
+  later.
 
 ## Development
 
@@ -97,10 +117,18 @@ npm test      # unit tests + browser simulations
 ```
 
 - `test/store.test.js`: unit tests for the queue logic (adding, moving, history,
-  saved queues, limits).
+  saved queues, limits, backup merge/replace, CSV).
 - `test/sim/*.sim.js`: load the script into a fake YouTube page and check real
   behavior (menus, panel, auto-play, saved queues, in-place video switching,
-  title repair, safety-net reloads).
+  title repair, safety-net reloads, exporting to a playlist against a fake YouTube API,
+  backup download and import).
+
+## Credits
+
+The playlist export follows the approach of
+[channel-to-playlist](https://github.com/hubert2gavin/channel-to-playlist) by Hubert Gavin
+(MIT License): create the playlist once, add videos one at a time, back off when YouTube
+is busy, and skip unavailable videos.
 
 ## License
 

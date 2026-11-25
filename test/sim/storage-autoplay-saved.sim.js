@@ -80,7 +80,7 @@ assert.deepEqual(navigations, [`/watch?v=${A}`], 'auto-play On: plays the next o
 click(tabSaved());
 assert.equal(q('.sq-savebar').hidden, false);
 assert.equal(q('.sq-tools').hidden, true);
-assert.equal(q('.sq-text-btn').hidden, true, 'no Clear all on the Saved tab');
+assert.equal(q('.sq-clear').hidden, true, 'no Clear all on the Saved tab');
 assert.match(q('.sq-empty').textContent, /No saved queues yet/);
 click(q('.sq-save-btn'));
 assert.match(toastText(), /Type a name first/);
