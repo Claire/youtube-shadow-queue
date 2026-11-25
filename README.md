@@ -107,6 +107,38 @@ Open the script in your userscript manager and edit the block at the top:
   add per day: if an export stops with a "limiting requests" message, press **Resume**
   later.
 
+## Tools: sort a big queue (optional)
+
+These run on your computer with Node 20+, not in the browser. They need your own
+YouTube Data API key, which stays in a `.env` file that git ignores.
+
+### 1. Get a YouTube Data API key (once)
+
+1. Go to [Google Cloud Console](https://console.cloud.google.com/), create a project.
+2. **APIs & Services → Library**, find **YouTube Data API v3**, click **Enable**.
+3. **APIs & Services → Credentials → Create credentials → API key**. Under
+   restrictions, limit it to **YouTube Data API v3**.
+4. In this repo folder, create a file named `.env` with one line:
+   `YT_API_KEY=your-key`. Never paste the key anywhere else.
+
+### 2. Add details to a backup
+
+In the Queue panel click **Backup**, then in this repo folder run:
+
+```sh
+node tools/enrich.mjs ~/Downloads/youtube-queue-backup-2026-11-25.json
+```
+
+It looks up every video's channel, category, tags, topics and length, prints the top
+categories and channels, and saves `data/enriched.json`. It costs 1 quota unit per
+50 videos (the free allowance is 10,000 units a day). Running it again only looks up
+videos it hasn't seen; add `--refresh` to look everything up again. Videos that are
+private or deleted are marked unavailable. If the daily allowance runs out, progress
+is kept; run it again the next day.
+
+The key is sent only to `www.googleapis.com`, in a request header, and is never printed
+or saved anywhere else. `data/` holds your viewing list, so it's git-ignored too.
+
 ## Development
 
 The script is one file so it can be installed directly. Tests need Node 20+.
@@ -116,6 +148,8 @@ npm install   # installs jsdom for the browser simulations
 npm test      # unit tests + browser simulations
 ```
 
+- `test/enrich.test.mjs`: tests for `tools/enrich.mjs` against a fake YouTube
+  (batching, cache, quota stop, error advice, and that the key never leaks).
 - `test/store.test.js`: unit tests for the queue logic (adding, moving, history,
   saved queues, limits, backup merge/replace, CSV).
 - `test/sim/*.sim.js`: load the script into a fake YouTube page and check real

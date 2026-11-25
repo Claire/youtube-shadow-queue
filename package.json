@@ -5,8 +5,9 @@
   "description": "Userscript: \"Play next\" / \"Play last\" queue for desktop YouTube, with history, saved queues and Picture-in-Picture-friendly playback.",
   "license": "MIT",
   "scripts": {
-    "test": "node --test test/store.test.js && node test/run-sims.js",
-    "test:unit": "node --test test/store.test.js",
+    "test": "node --test test/store.test.js test/enrich.test.mjs && node test/run-sims.js",
+    "test:unit": "node --test test/store.test.js test/enrich.test.mjs",
+    "enrich": "node tools/enrich.mjs",
     "test:sim": "node test/run-sims.js"
   },
   "devDependencies": {

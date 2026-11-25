@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+- **`tools/enrich.mjs`** (optional, runs on your computer, not part of the userscript):
+  adds channel, category, tags, topics and length to a backup using the YouTube Data API.
+  Answers are cached, so running it again only looks up new videos.
+
 ## 1.2.0
 - **Backup & restore** (buttons at the bottom of the panel):
   - **Backup** downloads a `.json` file with your queue, history and saved queues.
