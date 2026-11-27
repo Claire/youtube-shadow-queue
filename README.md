@@ -145,10 +145,10 @@ Open `tools/organizer.html` in your browser (double-click it) and click
 **Open enriched.json…** (it's in the `data` folder). No key needed.
 
 - **Filter** on the left: search, plus where the video is now, category, channel, topic,
-  tag, length, upload date (past week … over 3 years ago) and status.
+  tag, length, upload date (past week … over 3 years ago) and status. Ticks inside one
+  filter mean "any of these"; different filters combine.
 - Each video shows when it was uploaded ("2 years ago"; hover for the exact date).
-  **Sort** by newest or oldest upload. Ticks inside one filter mean "any of these"; different filters
-  combine.
+  **Sort** by newest or oldest upload.
 - **Tick videos** (Shift-click for a range, or **Select all shown**), type a name, and
   click **New queue from selected**. Tick **Not in a new queue yet** to see what's left.
 - Click **Download for the Queue panel**, then in YouTube: Queue panel → **Import** →
@@ -156,6 +156,36 @@ Open `tools/organizer.html` in your browser (double-click it) and click
 
 Your new queues are remembered in that browser while you work. The page loads nothing
 but video pictures from YouTube (turn off **Pictures** to load none).
+
+### 4. Let Claude suggest groups (optional)
+
+YouTube's categories are rough ("People & Blogs" is often just the default). Claude can
+read your titles, channels and descriptions and group videos by what they're about.
+You need a Claude API key from [platform.claude.com](https://platform.claude.com/);
+add a second line to `.env`: `ANTHROPIC_API_KEY=your-key`.
+
+```sh
+node tools/tag.mjs propose     # Claude suggests groups → data/groups.txt
+# open data/groups.txt: rename, delete, merge or add lines ("Name: what belongs in it")
+node tools/tag.mjs sort        # Claude puts each video in one of your groups
+```
+
+`sort` prints how many videos went into each group and saves `data/ai-queues.json`.
+In YouTube: Queue panel → **Import** → that file → **Add saved queues**. The organizer
+also gets a **Claude's groups** filter.
+
+- `--pictures` (on either step): Claude also looks at the thumbnails, to spot styles
+  like "animated", "AI cartoon" or "talking head". Thumbnails go straight from YouTube
+  to Claude.
+- `--only "People & Blogs"`: just one YouTube category.
+- **Cost** with Claude Haiku 5.5 (the default): about 2 US cents for 500 videos, about 2.5
+  with `--pictures`. It estimates first and stops above `--max-cost` (default $1).
+- Answers are cached, so running `sort` again only asks about new videos. Editing
+  `groups.txt` sorts everything again.
+- Claude can only choose from your groups. An answer that doesn't match is ignored and
+  asked again next run.
+- The key is sent only to `api.anthropic.com`, in a request header, and is never printed
+  or saved anywhere else. To use another model, add `CLAUDE_MODEL=...` to `.env`.
 
 ## Development
 
@@ -168,6 +198,8 @@ npm test      # unit tests + browser simulations
 
 - `test/enrich.test.mjs`: tests for `tools/enrich.mjs` against a fake YouTube
   (batching, cache, quota stop, error advice, and that the key never leaks).
+- `test/tag.test.mjs`: tests for `tools/tag.mjs` against a fake Claude (groups file,
+  batching, pictures, cache, cost limit, error advice, and that the key never leaks).
 - `test/store.test.js`: unit tests for the queue logic (adding, moving, history,
   saved queues, limits, backup merge/replace, CSV).
 - `test/sim/organizer.sim.js`: drives `tools/organizer.html` and checks the userscript

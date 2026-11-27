@@ -98,6 +98,7 @@
   .chip { background: var(--chip); border-radius: 999px; padding: .05rem .55rem; font-size: .82rem; }
   .chip.group { background: var(--soft); color: var(--accent); font-weight: 650; }
   .chip.bad { color: var(--warn); font-weight: 650; }
+  .chip.ai { border: 1px solid var(--accent); }
 
   .qcard { border: 1px solid var(--line); border-radius: .7rem; padding: .6rem; margin-top: .6rem; }
   .qcard input[type=text] { font-weight: 650; }
@@ -197,6 +198,7 @@
   const MAX_FILE_BYTES = 50 * 1024 * 1024;
   const STORE_KEY = 'shadowQueueOrganizer.v1';
   const UNGROUPED = 'Not in a new queue yet';
+  const NO_AI = 'Not sorted by Claude yet';
   const LENGTHS = [['Under 5 min', 300], ['5–20 min', 1200], ['20–60 min', 3600], ['Over 1 hour', Infinity]];
   const DAY = 86400000;
   const AGES = [['Past week', 7 * DAY], ['Past month', 30 * DAY], ['Past year', 365 * DAY], ['1–3 years ago', 3 * 365 * DAY], ['Over 3 years ago', Infinity]];
@@ -285,6 +287,7 @@
       published: Date.parse(str(raw.publishedAt, 40)) || 0,
       status: raw.unavailable ? 'Unavailable (private or deleted)' : raw.pending ? 'Not looked up yet' : 'Available',
       description: str(raw.description, 1000),
+      ai: str(raw.ai, 60), // group from tools/tag.mjs, if you ran it
     };
     v.text = lower([v.title, v.channel, ...tags].join(' '));
     v.descText = lower(v.description);
@@ -336,6 +339,8 @@
 
   const FACETS = [
     { key: 'group', label: 'New queues', get: (v) => groupIndex.get(v.id) || [UNGROUPED], open: true },
+    // Only shown when the file has groups from tools/tag.mjs.
+    { key: 'ai', label: 'Claude\'s groups', get: (v) => [v.ai || NO_AI], open: true, when: () => state.videos.some((v) => v.ai) },
     { key: 'list', label: 'Where it is now', get: (v) => v.lists },
     { key: 'category', label: 'Category', get: (v) => [v.category], open: true },
     { key: 'channel', label: 'Channel', get: (v) => [v.channel], searchable: true, open: true },
@@ -363,6 +368,7 @@
     box.replaceChildren();
     facetUi.clear();
     for (const f of FACETS) {
+      if (f.when && !f.when()) continue;
       const list = el('div', { className: 'facet-list' });
       const ui = { list, query: null, expanded: false, sum: el('summary', { textContent: f.label }) };
       const det = el('details', { className: 'facet', open: !!f.open }, ui.sum);
@@ -380,6 +386,7 @@
 
   function renderFacet(f) {
     const ui = facetUi.get(f.key);
+    if (!ui) return; // a filter that isn't shown for this file
     const chosen = state.filters.get(f.key) || new Set();
     const counts = new Map();
     for (const v of state.videos) {
@@ -459,6 +466,7 @@
     }
     const chips = el('div', { className: 'chips' },
       ...(groupIndex.get(v.id) || []).map((n) => el('span', { className: 'chip group', textContent: n })),
+      v.ai ? el('span', { className: 'chip ai', textContent: v.ai, title: 'Claude\'s group' }) : null,
       ...v.lists.map((l) => el('span', { className: 'chip', textContent: l })),
       v.status === 'Available' ? null : el('span', { className: 'chip bad', textContent: v.status }));
     return el('div', { className: `row${state.selected.has(v.id) ? ' sel' : ''}` },

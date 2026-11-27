@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+- **`tools/tag.mjs`** (optional, runs on your computer): Claude suggests groups for your
+  videos (`propose`, saved to `data/groups.txt` for you to edit), then puts each video in
+  one (`sort`). Reads titles, channels and descriptions; `--pictures` adds the
+  thumbnails, to spot styles like "animated" or "talking head". Makes a saved-queues-only
+  file for **Import → Add saved queues**. Estimates the cost first and stops above
+  `--max-cost` (default $1); about 2 US cents for 500 videos (about 2.5 with pictures).
+- **Organizer:** a **Claude's groups** filter and a chip on each video, once `tag.mjs`
+  has run.
+
 ## 1.3.0
 - **Import "saved queues only" files** (made by the organizer): the Queue panel shows
   their names and offers only **Add saved queues**; your queue and history are never

@@ -91,6 +91,7 @@ function open(storage = {}) {
   await choose('enriched.json', enriched);
   assert.equal($('#app').hidden, false);
   assert.equal(count(), '8 videos');
+  assert.ok(!$$('details.facet summary').some((x) => /Claude/.test(x.textContent)), "no Claude filter until tag.mjs has run");
   assert.equal($('.row a').href, `https://www.youtube.com/watch?v=${id('A')}`);
   assert.ok(!$$('.row img').some((img) => img.getAttribute('src') === 'x'), 'title HTML was not run');
   assert.ok($$('.row a').some((a) => a.textContent === '<img src=x onerror=alert(1)>'));
@@ -262,6 +263,19 @@ function open(storage = {}) {
   $('#startOver').click();
   assert.equal($$('.qcard').length, 0);
   assert.equal($('#exportBox').hidden, true);
+
+  // 14. Groups from tools/tag.mjs: their own filter (with what's left) and a chip on each row
+  const tagged = structuredClone(enriched);
+  tagged.videos[id('A')].ai = 'Health explainers';
+  tagged.videos[id('B')].ai = 'Health explainers';
+  tagged.videos[id('C')].ai = 'Body language';
+  await choose('enriched.json', tagged);
+  assert.equal(facetOpt("Claude's groups", 'Health explainers').querySelector('.n').textContent, '2');
+  assert.equal(facetOpt("Claude's groups", 'Not sorted by Claude yet').querySelector('.n').textContent, '5');
+  facetOpt("Claude's groups", 'Body language').querySelector('input').click();
+  assert.equal(count(), '1 video of 8');
+  assert.equal($('.row .chip.ai').textContent, 'Body language');
+  assert.equal($$('.row .chip.ai').length, 1);
 
   assert.deepEqual(errors, []);
   console.log('Organizer test: all checks passed');

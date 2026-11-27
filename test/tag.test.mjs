@@ -7,6 +7,7 @@ import path from 'node:path';
 import {
   parseGroups, formatGroups, fingerprint, pickVideos, videoLine, spread, cost, explain, ClaudeError,
   askTool, sortVideos, buildQueues, parseArgs, main, API_URL, BATCH, DEFAULT_MODEL,
+  proposeRequest, sortRequest, requestTokens, thumbnailUrl, isPictureProblem,
 } from '../tools/tag.mjs';
 
 const KEY = 'sk-ant-TEST-not-a-real-key-0000000000';
@@ -29,7 +30,9 @@ function fakeClaude({ decide = (title) => (/story/i.test(title) ? 'Stories' : 'H
     if (tool === 'propose_groups') {
       input = propose ?? { groups: [{ name: 'Health: tips', description: 'doctors' }, { name: 'Stories', description: 'cartoons' }, { name: 'health tips', description: 'repeat' }] };
     } else {
-      const lines = body.messages[0].content.split('<videos>\n')[1].split('\n</videos>')[0].split('\n');
+      const content = body.messages[0].content;
+      const text = typeof content === 'string' ? content : content.at(-1).text; // with pictures, the text comes last
+      const lines = text.split('<videos>\n')[1].split('\n</videos>')[0].split('\n');
       input = { results: lines.map((line) => { const [, n, title] = line.match(/^\[(\d+)\] ([^|]*)/); return { n: Number(n), group: decide(title.trim(), Number(n)) }; }) };
     }
     return Response.json({ content: [{ type: 'text', text: 'ok' }, { type: 'tool_use', id: 't1', name: tool, input }], stop_reason: 'tool_use', usage: { input_tokens: 1000, output_tokens: 100 } });
@@ -64,7 +67,9 @@ test('videoLine is one short line, whatever the description holds', () => {
   assert.match(line, /^\[7\] A B \| Chan \| People & Blogs \| tags: tag0, .*tag7 \| line1 line2 z+$/);
   assert.ok(!line.includes('tag8'));
   assert.ok(line.length < 700);
-  assert.equal(videoLine(vid(1), 2, false), '[2] Video 1 | Chan');
+  assert.equal(videoLine(vid(1), 2, false), '[2] Video 1 | Chan | about things', 'proposing reads descriptions too');
+  assert.equal(videoLine(vid(1, { description: 'd'.repeat(500) }), 2, false).length, '[2] Video 1 | Chan | '.length + 200);
+  assert.equal(videoLine(vid(1, { description: '' }), 2, false), '[2] Video 1 | Chan');
 });
 
 test('spread samples evenly from the whole list', () => {
@@ -165,10 +170,85 @@ test('buildQueues: a saved-queues-only file, groups in order, queue order inside
 });
 
 test('parseArgs', () => {
-  assert.deepEqual(parseArgs(['sort', '--only', 'People & Blogs', '--max-cost=2']), { command: 'sort', only: 'People & Blogs', maxCost: 2, bad: null });
+  assert.deepEqual(parseArgs(['sort', '--only', 'People & Blogs', '--max-cost=2']), { command: 'sort', only: 'People & Blogs', maxCost: 2, pictures: false, bad: null });
+  assert.equal(parseArgs(['propose', '--pictures']).pictures, true);
   assert.equal(parseArgs(['sort', '--max-cost', 'lots']).bad, '--max-cost');
   assert.equal(parseArgs(['sort', '--only']).bad, '--only');
   assert.equal(parseArgs(['sorting']).bad, 'sorting');
+});
+
+const picturesIn = (body) => {
+  const content = body.messages[0].content;
+  if (typeof content === 'string') return [];
+  const out = [];
+  content.forEach((b, i) => { if (b.type === 'image') out.push({ label: content[i - 1].text, url: b.source.url, type: b.source.type }); });
+  return out;
+};
+
+test('pictures: each thumbnail is labeled with its video number and comes before the question', async () => {
+  const claude = fakeClaude();
+  const batch = [vid(1), vid(2)];
+  const request = sortRequest(GROUPS, batch, { pictures: true });
+  await askTool({ fetchFn: claude.fetchFn, key: KEY, model: 'm' }, request);
+  const content = claude.calls[0].body.messages[0].content;
+  assert.deepEqual(picturesIn(claude.calls[0].body), [
+    { label: '[1]', url: `https://i.ytimg.com/vi/${id(1)}/mqdefault.jpg`, type: 'url' },
+    { label: '[2]', url: `https://i.ytimg.com/vi/${id(2)}/mqdefault.jpg`, type: 'url' },
+  ]);
+  assert.equal(content.at(-1).type, 'text', 'the question comes after the pictures');
+  assert.match(content.at(-1).text, /thumbnail is shown above[\s\S]*\[1\] Video 1/);
+  assert.equal(thumbnailUrl(id(5)), `https://i.ytimg.com/vi/${id(5)}/mqdefault.jpg`);
+  const plain = sortRequest(GROUPS, batch);
+  assert.deepEqual(plain.pictures, []);
+  assert.equal(requestTokens(request) - requestTokens({ ...request, pictures: [] }), 2 * 90, '84 tokens a thumbnail + its label');
+});
+
+test('propose: reads descriptions, samples a huge queue evenly, and shows up to 200 thumbnails', () => {
+  const few = proposeRequest([vid(1, { description: 'knees and backs' })]);
+  assert.match(few.prompt, /\[1\] Video 1 \| Chan \| knees and backs/);
+  assert.deepEqual(few.pictures, []);
+
+  const huge = Array.from({ length: 3000 }, (_, i) => vid(i, { title: `A fairly long video title number ${i}`, description: 'x'.repeat(400) }));
+  const r = proposeRequest(huge, { pictures: true });
+  const lines = r.prompt.split('<videos>\n')[1].split('\n</videos>')[0].split('\n');
+  assert.ok(lines.length < 3000 && lines.length > 500, `sampled ${lines.length}`);
+  assert.match(lines.at(-1), /number 29\d\d/, 'sample reaches the end of the queue');
+  assert.ok(requestTokens(r) < 100_000, `stays in the cheaper price tier: ${requestTokens(r)}`);
+  assert.equal(r.pictures.length, 200);
+  for (const p of r.pictures) assert.match(lines[p.n - 1], new RegExp(`^\\[${p.n}\\] `), 'labels match the numbered lines');
+  assert.match(r.prompt, /thumbnails above show 200 of these videos/);
+});
+
+test('pictures: if Claude cannot load a thumbnail, that batch is asked again from text alone', async () => {
+  const claude = fakeClaude({ fail: (n, body) => (picturesIn(body).length ? claudeError(400, 'invalid_request_error', 'Unable to download the file at the image URL') : null) });
+  const cache = {};
+  const said = [];
+  const r = await sortVideos({ videos: [vid(1), vid(2, { title: 'Story 2' })], groups: GROUPS, cache, pictures: true,
+    api: { fetchFn: claude.fetchFn, key: KEY, model: 'm', sleep: noSleep }, usage: { input: 0, output: 0 }, log: (s) => said.push(s) });
+  assert.equal(claude.calls.length, 2);
+  assert.equal(picturesIn(claude.calls[1].body).length, 0);
+  assert.equal(r.missing, 0);
+  assert.match(said.join('\n'), /judged from text only/);
+  assert.equal(isPictureProblem(new ClaudeError(400, 'invalid_request_error', 'max_tokens too big')), false, 'other mistakes are not hidden');
+  const other = fakeClaude({ fail: () => claudeError(400, 'invalid_request_error', 'max_tokens too big') });
+  await assert.rejects(sortVideos({ videos: [vid(1)], groups: GROUPS, cache: {}, pictures: true,
+    api: { fetchFn: other.fetchFn, key: KEY, model: 'm' }, usage: { input: 0, output: 0 } }));
+});
+
+test('pictures: adding --pictures re-sorts text-only answers; leaving it off later keeps picture answers', async () => {
+  const videos = [vid(1), vid(2)];
+  const run = async (cache, pictures) => {
+    const claude = fakeClaude();
+    await sortVideos({ videos, groups: GROUPS, cache, pictures, api: { fetchFn: claude.fetchFn, key: KEY, model: 'm' }, usage: { input: 0, output: 0 } });
+    return claude.calls.length;
+  };
+  const cache = {};
+  assert.equal(await run(cache, false), 1);
+  assert.equal(await run(cache, false), 0, 'cached');
+  assert.equal(await run(cache, true), 1, 'now with pictures: asked again');
+  assert.equal(cache.pictures, true);
+  assert.equal(await run(cache, false), 0, 'picture answers are kept');
+  assert.equal(await run(cache, true), 0);
 });
 
 async function setup(videos = Array.from({ length: 50 }, (_, i) => vid(i, { title: i % 2 ? `Story ${i}` : `Doctor ${i}` }))) {
@@ -231,6 +311,27 @@ test('main: --only sorts one category and keeps the others\' groups', async () =
   assert.equal(JSON.parse(await t.read('enriched.json')).videos[id(1)].ai, 'Health');
   assert.match(t.claude.calls[1].body.messages[0].content, /Doctor 1/);
   assert.doesNotMatch(t.claude.calls[1].body.messages[0].content, /Story 2/, 'Music was already sorted');
+});
+
+test('main: --pictures on both steps, and the cost estimate counts the pictures', async () => {
+  const t = await setup();
+  assert.equal(await t.run(['propose', '--pictures']), 0);
+  assert.equal(picturesIn(t.claude.calls[0].body).length, 50);
+  assert.match(t.printed.join('\n'), /suggest groups for 50 videos, with 50 thumbnails…/);
+  assert.match(t.printed.join('\n'), /then run:  node tools\/tag\.mjs sort --pictures/);
+  assert.equal(await t.run(['sort', '--pictures']), 0);
+  assert.deepEqual(t.claude.calls.slice(1).map((c) => picturesIn(c.body).length), [40, 10]);
+  assert.match(t.printed.join('\n'), /into 4 groups, with thumbnails…/);
+
+  const many = Array.from({ length: 2000 }, (_, i) => vid(i));
+  const u = await setup(many);
+  await writeFile(path.join(u.root, 'data', 'groups.txt'), formatGroups(GROUPS));
+  assert.equal(await u.run(['sort', '--max-cost', '0.01']), 1);
+  const textOnly = Number(u.printed.pop().match(/\$(\d+\.\d+)/)[1]);
+  assert.equal(await u.run(['sort', '--pictures', '--max-cost', '0.01']), 1);
+  const withPictures = Number(u.printed.pop().match(/\$(\d+\.\d+)/)[1]);
+  assert.ok(withPictures > textOnly, `${withPictures} > ${textOnly}`);
+  assert.equal(u.claude.calls.length, 0);
 });
 
 test('main: spending limit stops before asking Claude', async () => {
