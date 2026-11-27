@@ -722,6 +722,28 @@ test('restore: rejects files that are not our backups, or from a newer version',
   assert.deepEqual(s.get(), { current: null, items: [], played: [], paused: false }, 'nothing changed');
 });
 
+test('saved-queues-only file (from the organizer): adds saved queues, never touches the queue', () => {
+  const s = storeWithEverything();
+  const before = s.get();
+  const file = viaFile({
+    format: BACKUP_FORMAT, version: 2, exportedAt: new Date().toISOString(),
+    saved: [{ name: 'Health', items: [A, B], at: 5 }, { name: 'Mix', items: [A], at: 6 }],
+  });
+  const check = s.inspectBackup(file);
+  assert.equal(check.savedOnly, true);
+  assert.deepEqual(check.counts, { upNext: 0, played: 0, saved: 2 });
+  assert.deepEqual(s.importBackup(file, 'replace'), { ok: false, reason: 'saved-only' });
+  assert.deepEqual(s.get(), before, 'replace refused: nothing changed');
+  const r = s.importBackup(file, 'merge');
+  assert.equal(r.savedOnly, true);
+  assert.deepEqual([r.added, r.playedAdded, r.savedAdded, r.savedRenamed], [0, 0, 1, 1]);
+  assert.deepEqual(s.get(), before, 'queue and history untouched');
+  assert.deepEqual(s.listSaved().map((q) => q.name).sort(), ['Health', 'Mix', 'Mix (imported)']);
+  assert.equal(s.inspectBackup(viaFile(s.exportBackup())).savedOnly, false, 'full backups are not saved-only');
+  assert.equal(s.exportBackup().version, 1, 'full backups still say version 1, so 1.2.0 can read them');
+  assert.deepEqual(s.importBackup({ format: BACKUP_FORMAT, version: 3, saved: [] }, 'merge'), { ok: false, reason: 'newer' });
+});
+
 test('restore: damaged or hand-edited contents are cleaned, never trusted', () => {
   const s = createStore(fakeStorage());
   const r = s.importBackup({

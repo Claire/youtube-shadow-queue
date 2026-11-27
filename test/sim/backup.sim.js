@@ -134,6 +134,28 @@ async function chooseFile(name, text) {
   assert.equal(q('.sq-import').hidden, true);
   assert.equal(ids(state().items), 'AB');
 
+  // 8. A saved-queues-only file (from the organizer): only "Add saved queues", queue untouched
+  await chooseFile('organized.json', JSON.stringify({
+    format: 'youtube-shadow-queue-backup', version: 2,
+    saved: [{ name: 'Health', items: [v('G'), v('H')], at: 9 }],
+  }));
+  assert.equal(q('.sq-import').hidden, false);
+  assert.match(q('.sq-import').textContent, /1 saved queue: Health/);
+  assert.match(q('.sq-import').textContent, /Your queue and history stay as they are/);
+  const replaceBtn = qa('.sq-import .sq-big-btn').find((b) => /Replace/.test(b.textContent));
+  assert.equal(replaceBtn.hidden, true, 'no Replace all for saved-only files');
+  click(qa('.sq-import .sq-big-btn').find((b) => b.textContent === 'Add saved queues'));
+  assert.deepEqual(savedNames(), ['Health', 'Mix']);
+  assert.equal(ids(state().items), 'AB', 'queue untouched');
+  assert.match(toast(), /^Added 1 saved queue$/);
+  assert.equal(q('.sq-tab[aria-selected="true"]')?.textContent.includes('Saved'), true, 'shows the Saved tab');
+
+  // 9. A normal backup afterwards gets Merge and Replace all back
+  await chooseFile('b.json', backupText);
+  assert.equal(qa('.sq-import .sq-big-btn').find((b) => /Replace/.test(b.textContent)).hidden, false);
+  assert.ok(qa('.sq-import .sq-big-btn').some((b) => b.textContent === 'Merge'));
+  click(qa('.sq-import .sq-big-btn').find((b) => b.textContent === 'Cancel'));
+
   assert.deepEqual(errors, []);
   console.log('Backup & restore test: all checks passed');
   window.close();

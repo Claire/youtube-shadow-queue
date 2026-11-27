@@ -139,6 +139,24 @@ is kept; run it again the next day.
 The key is sent only to `www.googleapis.com`, in a request header, and is never printed
 or saved anywhere else. `data/` holds your viewing list, so it's git-ignored too.
 
+### 3. Sort it into smaller queues
+
+Open `tools/organizer.html` in your browser (double-click it) and click
+**Open enriched.json…** (it's in the `data` folder). No key needed.
+
+- **Filter** on the left: search, plus where the video is now, category, channel, topic,
+  tag, length, upload date (past week … over 3 years ago) and status.
+- Each video shows when it was uploaded ("2 years ago"; hover for the exact date).
+  **Sort** by newest or oldest upload. Ticks inside one filter mean "any of these"; different filters
+  combine.
+- **Tick videos** (Shift-click for a range, or **Select all shown**), type a name, and
+  click **New queue from selected**. Tick **Not in a new queue yet** to see what's left.
+- Click **Download for the Queue panel**, then in YouTube: Queue panel → **Import** →
+  **Add saved queues**. They appear in the Saved tab; your queue isn't changed.
+
+Your new queues are remembered in that browser while you work. The page loads nothing
+but video pictures from YouTube (turn off **Pictures** to load none).
+
 ## Development
 
 The script is one file so it can be installed directly. Tests need Node 20+.
@@ -152,6 +170,8 @@ npm test      # unit tests + browser simulations
   (batching, cache, quota stop, error advice, and that the key never leaks).
 - `test/store.test.js`: unit tests for the queue logic (adding, moving, history,
   saved queues, limits, backup merge/replace, CSV).
+- `test/sim/organizer.sim.js`: drives `tools/organizer.html` and checks the userscript
+  accepts what it downloads.
 - `test/sim/*.sim.js`: load the script into a fake YouTube page and check real
   behavior (menus, panel, auto-play, saved queues, in-place video switching,
   title repair, safety-net reloads, exporting to a playlist against a fake YouTube API,

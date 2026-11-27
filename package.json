@@ -1,6 +1,6 @@
 {
   "name": "youtube-shadow-queue",
-  "version": "1.2.0",
+  "version": "1.3.0",
   "private": true,
   "description": "Userscript: \"Play next\" / \"Play last\" queue for desktop YouTube, with history, saved queues and Picture-in-Picture-friendly playback.",
   "license": "MIT",

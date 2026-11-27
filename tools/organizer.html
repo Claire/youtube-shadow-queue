@@ -1,0 +1,690 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<!-- Nothing leaves your computer: the only thing this page may load is YouTube thumbnails. -->
+<meta http-equiv="Content-Security-Policy"
+  content="default-src 'none'; img-src https://i.ytimg.com; style-src 'unsafe-inline'; script-src 'unsafe-inline'; base-uri 'none'; form-action 'none'">
+<title>Queue Organizer</title>
+<!--
+  Queue Organizer: sort a big YouTube Shadow Queue into smaller saved queues.
+
+  How to use (no install, no internet needed except for thumbnails):
+    1. Run tools/enrich.mjs on a backup. It writes data/enriched.json.
+    2. Open this file in your browser (double-click it) and open data/enriched.json.
+    3. Filter on the left, tick videos, put them in new queues on the right.
+    4. Click "Download for the Queue panel", then in YouTube: Queue panel → Import →
+       Add saved queues.
+
+  Think of it like sorting a big pile of mail: the filters are the "show me only
+  bills" buttons, the new queues on the right are the labeled trays.
+
+  Your new queues are remembered in this browser while you work, so closing the tab
+  loses nothing. Everything in the file is treated as untrusted text: it is shown
+  with textContent only, and links are built from checked video ids.
+-->
+<style>
+  :root {
+    --fs: 18px;
+    --bg: #eef1f7; --panel: #ffffff; --text: #1b1f2a; --muted: #5b6475; --line: #d7dce6;
+    --accent: #6d4aff; --accent-text: #ffffff; --soft: #ece8ff; --warn: #b3261e; --chip: #eef0f4;
+    --focus: #6d4aff;
+    color-scheme: light;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #12141a; --panel: #1c1f27; --text: #eceef3; --muted: #a3abbb; --line: #2f3442;
+      --accent: #9d86ff; --accent-text: #12141a; --soft: #2a2546; --warn: #ff8a80; --chip: #272b36;
+      --focus: #b8a8ff;
+      color-scheme: dark;
+    }
+  }
+  * { box-sizing: border-box; }
+  html { font-size: var(--fs); }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 1rem/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  button, input, select { font: inherit; color: inherit; }
+  :focus-visible { outline: 3px solid var(--focus); outline-offset: 2px; }
+  [hidden] { display: none !important; }
+
+  header { display: flex; flex-wrap: wrap; align-items: center; gap: .6rem 1rem; padding: .8rem 1rem; background: var(--panel); border-bottom: 1px solid var(--line); position: sticky; top: 0; z-index: 2; }
+  header h1 { font-size: 1.3rem; margin: 0 .5rem 0 0; }
+  .grow { flex: 1; }
+  .muted { color: var(--muted); }
+  .btn { border: 1px solid var(--line); background: var(--panel); border-radius: .6rem; padding: .45rem .8rem; cursor: pointer; }
+  .btn:hover:not(:disabled) { border-color: var(--accent); }
+  .btn:disabled { opacity: .45; cursor: default; }
+  .btn.primary { background: var(--accent); color: var(--accent-text); border-color: var(--accent); font-weight: 650; }
+  .btn.armed { background: var(--warn); color: #fff; border-color: var(--warn); }
+  .btn.small { padding: .25rem .6rem; font-size: .9rem; }
+  .linklike { border: 0; background: none; padding: 0; color: var(--accent); cursor: pointer; text-decoration: underline; }
+
+  #msg { min-height: 1.45em; font-weight: 600; }
+
+  main { display: grid; grid-template-columns: 19rem minmax(0, 1fr) 21rem; gap: 1rem; padding: 1rem; align-items: start; }
+  @media (max-width: 1150px) { main { grid-template-columns: minmax(0, 1fr); } }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: .9rem; padding: .9rem; }
+  aside.card { position: sticky; top: 5rem; max-height: calc(100vh - 6rem); overflow: auto; }
+  @media (max-width: 1150px) { aside.card { position: static; max-height: none; } }
+  h2 { font-size: 1.1rem; margin: 0 0 .6rem; }
+
+  input[type=search], input[type=text], select { width: 100%; border: 1px solid var(--line); border-radius: .55rem; padding: .45rem .6rem; background: var(--bg); }
+  input[type=checkbox] { width: 1.1rem; height: 1.1rem; accent-color: var(--accent); flex: none; }
+
+  details.facet { border-top: 1px solid var(--line); padding: .5rem 0; }
+  details.facet > summary { cursor: pointer; font-weight: 650; list-style-position: outside; }
+  .facet-q { margin: .45rem 0; font-size: .9rem; }
+  .facet-list { display: grid; gap: .1rem; margin-top: .3rem; }
+  .opt { display: flex; align-items: center; gap: .5rem; padding: .15rem .2rem; border-radius: .4rem; cursor: pointer; }
+  .opt:hover { background: var(--soft); }
+  .opt .name { flex: 1; overflow-wrap: anywhere; }
+  .opt .n { color: var(--muted); font-variant-numeric: tabular-nums; font-size: .9rem; }
+
+  .bar { display: flex; flex-wrap: wrap; align-items: center; gap: .5rem .8rem; margin-bottom: .7rem; }
+  .bar select { width: auto; }
+  .count { font-size: 1.1rem; font-weight: 700; }
+
+  .rows { display: grid; gap: .35rem; }
+  .row { display: grid; grid-template-columns: auto auto minmax(0, 1fr); gap: .75rem; align-items: center; padding: .45rem; border-radius: .6rem; border: 1px solid transparent; }
+  .row:hover { border-color: var(--line); }
+  .row.sel { background: var(--soft); border-color: var(--accent); }
+  .row img, .row .noimg { width: 8.5rem; aspect-ratio: 16 / 9; border-radius: .45rem; object-fit: cover; background: var(--chip); display: block; }
+  .no-thumbs .row img, .no-thumbs .row .noimg { display: none; }
+  .row a { color: inherit; font-weight: 650; text-decoration: none; overflow-wrap: anywhere; }
+  .row a:hover { text-decoration: underline; }
+  .meta { color: var(--muted); font-size: .92rem; margin-top: .15rem; }
+  .when { cursor: help; white-space: nowrap; text-decoration: underline dotted; text-underline-offset: .2em; }
+  .chips { display: flex; flex-wrap: wrap; gap: .3rem; margin-top: .3rem; }
+  .chip { background: var(--chip); border-radius: 999px; padding: .05rem .55rem; font-size: .82rem; }
+  .chip.group { background: var(--soft); color: var(--accent); font-weight: 650; }
+  .chip.bad { color: var(--warn); font-weight: 650; }
+
+  .qcard { border: 1px solid var(--line); border-radius: .7rem; padding: .6rem; margin-top: .6rem; }
+  .qcard input[type=text] { font-weight: 650; }
+  .qcard .btns { display: flex; flex-wrap: wrap; gap: .35rem; margin-top: .45rem; }
+  .warn { color: var(--warn); font-size: .9rem; }
+
+  .empty { max-width: 40rem; margin: 3rem auto; text-align: left; }
+  .empty ol { padding-left: 1.3rem; }
+  .drop-hint { position: fixed; inset: 0; display: grid; place-items: center; background: color-mix(in srgb, var(--accent) 25%, transparent); font-size: 1.6rem; font-weight: 700; pointer-events: none; z-index: 5; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Queue Organizer</h1>
+  <button class="btn primary" id="open" type="button">Open enriched.json…</button>
+  <input id="file" type="file" accept="application/json,.json" hidden>
+  <span id="source" class="muted"></span>
+  <span class="grow"></span>
+  <label class="opt"><input id="thumbs" type="checkbox" checked> Pictures</label>
+  <span class="muted">Text</span>
+  <button class="btn small" id="smaller" type="button" title="Smaller text">A−</button>
+  <button class="btn small" id="bigger" type="button" title="Bigger text">A+</button>
+</header>
+
+<section id="welcome" class="card empty">
+  <h2>Sort a big queue into smaller ones</h2>
+  <ol>
+    <li>In YouTube, open the Queue panel and click <b>Backup</b>.</li>
+    <li>In the repo folder run <code>node tools/enrich.mjs ~/Downloads/youtube-queue-backup-….json</code>.</li>
+    <li>Click <b>Open enriched.json…</b> above (it's in the repo's <code>data</code> folder), or drop the file on this page.</li>
+  </ol>
+  <p class="muted">Nothing is uploaded. This page only loads video pictures from YouTube, and you can turn those off.</p>
+</section>
+
+<p id="msg" role="status" aria-live="polite" style="margin:.6rem 1rem 0"></p>
+
+<main id="app" hidden>
+  <aside class="card" aria-label="Filters">
+    <h2>Filter</h2>
+    <input id="search" type="search" placeholder="Search titles, channels, tags" aria-label="Search">
+    <label class="opt" style="margin-top:.35rem"><input id="searchDesc" type="checkbox"> Also search descriptions</label>
+    <p><button class="linklike" id="clearFilters" type="button">Clear all filters</button></p>
+    <div id="facets"></div>
+  </aside>
+
+  <section class="card" aria-label="Videos">
+    <div class="bar">
+      <span class="count" id="count"></span>
+      <button class="btn small" id="selectAll" type="button">Select all shown</button>
+      <button class="btn small" id="selectNone" type="button">Clear selection</button>
+      <span id="selCount" class="muted"></span>
+      <span class="grow"></span>
+      <span><label class="muted" for="sort">Sort</label>
+      <select id="sort">
+        <option value="queue">Queue order</option>
+        <option value="channel">Channel A–Z</option>
+        <option value="title">Title A–Z</option>
+        <option value="short">Shortest first</option>
+        <option value="long">Longest first</option>
+        <option value="new">Newest upload</option>
+        <option value="old">Oldest upload</option>
+      </select></span>
+    </div>
+    <div class="rows" id="rows"></div>
+    <p><button class="btn" id="more" type="button" hidden>Show more</button></p>
+  </section>
+
+  <aside class="card" aria-label="New queues">
+    <h2>New queues</h2>
+    <input id="newName" type="text" maxlength="60" placeholder="Name, e.g. Health" aria-label="New queue name">
+    <p><button class="btn primary" id="create" type="button" disabled>New queue from selected</button></p>
+    <div id="groups"></div>
+    <div id="exportBox" style="margin-top:1rem" hidden>
+      <button class="btn primary" id="export" type="button">Download for the Queue panel</button>
+      <p class="muted" style="font-size:.9rem">Then in YouTube: Queue panel → <b>Import</b> → <b>Add saved queues</b>. Your current queue isn't changed.</p>
+      <button class="linklike" id="startOver" type="button">Start over (delete these new queues)</button>
+    </div>
+  </aside>
+</main>
+
+<div class="drop-hint" id="dropHint" hidden>Drop enriched.json here</div>
+
+<script>
+'use strict';
+(() => {
+  /* ---------- Settings that must match the userscript ---------- */
+  const ENRICHED_FORMAT = 'youtube-shadow-queue-enriched';
+  const BACKUP_FORMAT = 'youtube-shadow-queue-backup';
+  const SAVED_ONLY_VERSION = 2;   // "saved queues only" files: the Queue panel offers only "Add"
+  const NAME_MAX = 60;            // longest saved-queue name the userscript keeps
+  const SAVED_MAX = 501;          // most videos one saved queue keeps (now playing + 500)
+  const ID_RE = /^[\w-]{11}$/;
+
+  /* ---------- Page settings ---------- */
+  const PAGE = 300;                       // rows drawn at a time; "Show more" adds another page
+  const FACET_TOP = 12;                   // values shown per filter before "Show all"
+  const MAX_FILE_BYTES = 50 * 1024 * 1024;
+  const STORE_KEY = 'shadowQueueOrganizer.v1';
+  const UNGROUPED = 'Not in a new queue yet';
+  const LENGTHS = [['Under 5 min', 300], ['5–20 min', 1200], ['20–60 min', 3600], ['Over 1 hour', Infinity]];
+  const DAY = 86400000;
+  const AGES = [['Past week', 7 * DAY], ['Past month', 30 * DAY], ['Past year', 365 * DAY], ['1–3 years ago', 3 * 365 * DAY], ['Over 3 years ago', Infinity]];
+
+  const $ = (id) => document.getElementById(id);
+  const el = (tag, props = {}, ...kids) => {
+    const n = Object.assign(document.createElement(tag), props);
+    n.append(...kids.filter((k) => k != null));
+    return n;
+  };
+  const say = (text) => { $('msg').textContent = text; };
+  const plural = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`;
+  const lower = (s) => s.toLocaleLowerCase();
+  const cleanName = (n) => String(n || '').replace(/\s+/g, ' ').trim().slice(0, NAME_MAX);
+
+  function clock(sec) {
+    if (!Number.isFinite(sec)) return '';
+    const h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60), s = Math.floor(sec % 60);
+    const mm = String(m).padStart(h ? 2 : 1, '0'), ss = String(s).padStart(2, '0');
+    return h ? `${h}:${mm}:${ss}` : `${mm}:${ss}`;
+  }
+  function total(sec) {
+    const h = Math.floor(sec / 3600), m = Math.round((sec % 3600) / 60);
+    return h ? `${h} h ${m} min` : `${m} min`;
+  }
+  /** Which "Uploaded" bucket a date falls in, counted back from when the file was opened. */
+  const ageLabel = (ms) => (ms ? AGES.find(([, max]) => state.now - ms < max)[0] : 'Unknown date');
+
+  /** "3 days ago", "2 months ago", "4 years ago". */
+  const relative = new Intl.RelativeTimeFormat('en', { numeric: 'auto' });
+  function ago(ms) {
+    if (!ms) return '';
+    const days = Math.max(0, Math.floor((state.now - ms) / DAY));
+    if (days < 1) return 'today';
+    if (days < 14) return relative.format(-days, 'day');
+    if (days < 60) return relative.format(-Math.floor(days / 7), 'week');
+    const from = new Date(ms), to = new Date(state.now); // whole calendar months, like a person counts
+    const months = (to.getFullYear() - from.getFullYear()) * 12 + to.getMonth() - from.getMonth() - (to.getDate() < from.getDate());
+    return months < 24 ? relative.format(-months, 'month') : relative.format(-Math.floor(months / 12), 'year');
+  }
+  const longDate = (ms) => new Date(ms).toLocaleDateString(undefined, { dateStyle: 'long' });
+
+  const lengthLabel = (sec) => (Number.isFinite(sec) ? LENGTHS.find(([, max]) => sec < max)[0] : 'Unknown length');
+
+  /* ---------- State ---------- */
+  const state = {
+    videos: [],            // in queue order
+    now: Date.now(),       // "Past week" etc. are counted from when the file was opened
+    byId: new Map(),
+    filters: new Map(),    // facet key → Set of chosen values
+    search: '',
+    searchDesc: false,
+    sort: 'queue',
+    selected: new Set(),
+    lastClicked: null,     // for Shift-click ranges
+    shown: PAGE,
+    groups: [],            // [{ name, ids: [] }] → become saved queues
+    prefs: { fs: 18, thumbs: true },
+  };
+  let shownList = [];      // the filtered, sorted list currently on screen
+
+  /* ---------- Remembering work in this browser ---------- */
+  function loadStore() {
+    try { return JSON.parse(localStorage.getItem(STORE_KEY)) || {}; } catch { return {}; }
+  }
+  function saveStore() {
+    try { localStorage.setItem(STORE_KEY, JSON.stringify({ groups: state.groups, prefs: state.prefs })); } catch { /* private window: works, just not remembered */ }
+  }
+
+  /* ---------- Reading the file (untrusted: copy only what we use, type-checked) ---------- */
+  const str = (x, max = 300) => (typeof x === 'string' ? x.slice(0, max) : '');
+  const strs = (x, max = 100) => (Array.isArray(x) ? x.filter((s) => typeof s === 'string' && s).map((s) => s.slice(0, max)) : []);
+
+  function prepare(raw, order) {
+    const tags = [...new Set(strs(raw.tags).map(lower))];
+    const v = {
+      id: raw.id,
+      order,
+      title: str(raw.title) || raw.id,
+      channel: str(raw.channel) || 'Unknown channel',
+      category: str(raw.category) || 'Unknown category',
+      topics: strs(raw.topics),
+      tags,
+      lists: strs(raw.lists),
+      seconds: Number.isFinite(raw.seconds) ? raw.seconds : null,
+      published: Date.parse(str(raw.publishedAt, 40)) || 0,
+      status: raw.unavailable ? 'Unavailable (private or deleted)' : raw.pending ? 'Not looked up yet' : 'Available',
+      description: str(raw.description, 1000),
+    };
+    v.text = lower([v.title, v.channel, ...tags].join(' '));
+    v.descText = lower(v.description);
+    return v;
+  }
+
+  function readEnriched(data) {
+    if (data?.format === BACKUP_FORMAT) throw new Error('That is a plain backup. Run tools/enrich.mjs on it first, then open data/enriched.json.');
+    if (data?.format !== ENRICHED_FORMAT || !data.videos || typeof data.videos !== 'object') throw new Error("That file isn't an enriched.json from tools/enrich.mjs.");
+    if (data.version > 1) throw new Error('That file is from a newer version of enrich.mjs. Update this page too.');
+    return Object.values(data.videos).filter((v) => v && ID_RE.test(v.id)).map(prepare);
+  }
+
+  async function openFile(file) {
+    if (!file) return;
+    if (file.size > MAX_FILE_BYTES) { say('That file is too big to be an enriched.json.'); return; }
+    let videos;
+    try {
+      videos = readEnriched(JSON.parse(await file.text()));
+    } catch (e) {
+      say(e instanceof SyntaxError ? "That file isn't readable JSON." : e.message);
+      return;
+    }
+    state.videos = videos;
+    state.byId = new Map(videos.map((v) => [v.id, v]));
+    state.now = Date.now();
+    state.filters.clear();
+    state.selected.clear();
+    state.shown = PAGE;
+    // Bring back new queues from last time, keeping only videos that are in this file.
+    const kept = (loadStore().groups || [])
+      .filter((g) => g && cleanName(g.name) && Array.isArray(g.ids))
+      .map((g) => ({ name: cleanName(g.name), ids: [...new Set(g.ids)].filter((id) => state.byId.has(id)) }));
+    state.groups = kept;
+    $('source').textContent = `${file.name} · ${plural(videos.length, 'video')}`;
+    $('welcome').hidden = true;
+    $('app').hidden = false;
+    buildFacets();
+    render();
+    say(kept.length ? `Opened. Your ${plural(kept.length, 'new queue')} from last time ${kept.length === 1 ? 'is' : 'are'} back.` : 'Opened. Filter on the left, tick videos, then make a new queue on the right.');
+  }
+
+  /* ---------- Filters ---------- */
+  let groupIndex = new Map(); // video id → names of new queues it is in
+  function indexGroups() {
+    groupIndex = new Map();
+    for (const g of state.groups) for (const id of g.ids) groupIndex.set(id, [...(groupIndex.get(id) || []), g.name]);
+  }
+
+  const FACETS = [
+    { key: 'group', label: 'New queues', get: (v) => groupIndex.get(v.id) || [UNGROUPED], open: true },
+    { key: 'list', label: 'Where it is now', get: (v) => v.lists },
+    { key: 'category', label: 'Category', get: (v) => [v.category], open: true },
+    { key: 'channel', label: 'Channel', get: (v) => [v.channel], searchable: true, open: true },
+    { key: 'topic', label: 'Topic', get: (v) => v.topics, searchable: true },
+    { key: 'tag', label: 'Tag', get: (v) => v.tags, searchable: true },
+    { key: 'length', label: 'Length', get: (v) => [lengthLabel(v.seconds)], order: [...LENGTHS.map(([l]) => l), 'Unknown length'] },
+    { key: 'age', label: 'Uploaded', get: (v) => [ageLabel(v.published)], order: [...AGES.map(([l]) => l), 'Unknown date'] },
+    { key: 'status', label: 'Status', get: (v) => [v.status] },
+  ];
+
+  function matches(v, exceptKey) {
+    for (const f of FACETS) {
+      if (f.key === exceptKey) continue;
+      const chosen = state.filters.get(f.key);
+      if (chosen?.size && !f.get(v).some((x) => chosen.has(x))) return false;
+    }
+    if (!state.search) return true;
+    const hay = state.searchDesc ? `${v.text} ${v.descText}` : v.text;
+    return lower(state.search).split(/\s+/).filter(Boolean).every((w) => hay.includes(w));
+  }
+
+  const facetUi = new Map(); // key → { list, query, expanded }
+  function buildFacets() {
+    const box = $('facets');
+    box.replaceChildren();
+    facetUi.clear();
+    for (const f of FACETS) {
+      const list = el('div', { className: 'facet-list' });
+      const ui = { list, query: null, expanded: false, sum: el('summary', { textContent: f.label }) };
+      const det = el('details', { className: 'facet', open: !!f.open }, ui.sum);
+      if (f.searchable) {
+        ui.query = el('input', { type: 'search', className: 'facet-q', placeholder: `Find a ${lower(f.label)}` });
+        ui.query.setAttribute('aria-label', `Find a ${lower(f.label)}`);
+        ui.query.addEventListener('input', () => renderFacet(f));
+        det.append(ui.query);
+      }
+      det.append(list);
+      box.append(det);
+      facetUi.set(f.key, ui);
+    }
+  }
+
+  function renderFacet(f) {
+    const ui = facetUi.get(f.key);
+    const chosen = state.filters.get(f.key) || new Set();
+    const counts = new Map();
+    for (const v of state.videos) {
+      if (!matches(v, f.key)) continue;
+      for (const x of f.get(v)) counts.set(x, (counts.get(x) || 0) + 1);
+    }
+    for (const x of chosen) if (!counts.has(x)) counts.set(x, 0); // keep ticked ones visible
+    let values = [...counts.keys()];
+    if (f.order) values.sort((a, b) => f.order.indexOf(a) - f.order.indexOf(b));
+    else values.sort((a, b) => (chosen.has(b) - chosen.has(a)) || (counts.get(b) - counts.get(a)) || a.localeCompare(b));
+    if (f.key === 'group') values.sort((a, b) => (b === UNGROUPED) - (a === UNGROUPED)); // "not yet" first
+    const q = ui.query ? lower(ui.query.value.trim()) : '';
+    if (q) values = values.filter((x) => lower(x).includes(q));
+    const all = values.length;
+    if (!ui.expanded && !q) values = values.slice(0, FACET_TOP);
+
+    ui.sum.textContent = chosen.size ? `${f.label} (${chosen.size})` : f.label;
+    ui.list.replaceChildren(...values.map((x) => {
+      const box = el('input', { type: 'checkbox', checked: chosen.has(x) });
+      box.addEventListener('change', () => toggleFilter(f.key, x, box.checked));
+      return el('label', { className: 'opt' }, box, el('span', { className: 'name', textContent: x }), el('span', { className: 'n', textContent: counts.get(x) }));
+    }));
+    if (!values.length) ui.list.append(el('span', { className: 'muted', textContent: q ? 'No match' : 'None' }));
+    if (all > values.length || ui.expanded) {
+      const more = el('button', { type: 'button', className: 'linklike', textContent: ui.expanded ? 'Show fewer' : `Show all ${all}` });
+      more.addEventListener('click', () => { ui.expanded = !ui.expanded; renderFacet(f); });
+      ui.list.append(more);
+    }
+  }
+
+  function toggleFilter(key, value, on) {
+    const set = state.filters.get(key) || new Set();
+    if (on) set.add(value); else set.delete(value);
+    state.filters.set(key, set);
+    state.shown = PAGE;
+    render();
+  }
+
+  /* ---------- Results ---------- */
+  const SORTS = {
+    queue: (a, b) => a.order - b.order,
+    channel: (a, b) => a.channel.localeCompare(b.channel) || a.order - b.order,
+    title: (a, b) => a.title.localeCompare(b.title),
+    short: (a, b) => (a.seconds ?? Infinity) - (b.seconds ?? Infinity),
+    long: (a, b) => (b.seconds ?? -1) - (a.seconds ?? -1),
+    new: (a, b) => b.published - a.published, // unknown dates (0) go last
+    old: (a, b) => (a.published || Infinity) - (b.published || Infinity) || a.order - b.order,
+  };
+
+  function renderRows() {
+    shownList = state.videos.filter((v) => matches(v)).sort(SORTS[state.sort]);
+    $('count').textContent = `${plural(shownList.length, 'video')}${shownList.length === state.videos.length ? '' : ` of ${state.videos.length}`}`;
+    const frag = document.createDocumentFragment();
+    for (const v of shownList.slice(0, state.shown)) frag.append(row(v));
+    $('rows').replaceChildren(frag);
+    if (!shownList.length) $('rows').append(el('p', { className: 'muted', textContent: 'No videos match. Try clearing a filter.' }));
+    const left = shownList.length - state.shown;
+    $('more').hidden = left <= 0;
+    $('more').textContent = `Show ${Math.min(left, PAGE)} more`;
+  }
+
+  function row(v) {
+    const box = el('input', { type: 'checkbox', checked: state.selected.has(v.id) });
+    box.setAttribute('aria-label', `Select ${v.title}`);
+    box.addEventListener('click', (e) => pick(v.id, box.checked, e.shiftKey));
+    let pic = el('div', { className: 'noimg' });
+    if (state.prefs.thumbs) {
+      const img = el('img', { src: `https://i.ytimg.com/vi/${v.id}/mqdefault.jpg`, alt: '', loading: 'lazy', decoding: 'async' });
+      img.addEventListener('error', () => img.replaceWith(el('div', { className: 'noimg' }))); // offline or removed: plain box
+      pic = img;
+    }
+    const link = el('a', { href: `https://www.youtube.com/watch?v=${v.id}`, target: '_blank', rel: 'noopener noreferrer', textContent: v.title });
+    const meta = el('div', { className: 'meta', textContent: [v.channel, clock(v.seconds), v.category].filter(Boolean).join(' · ') });
+    if (v.published) {
+      const when = el('span', { className: 'when', textContent: ago(v.published), title: `Uploaded ${longDate(v.published)}` });
+      meta.append(' · ', when);
+    }
+    const chips = el('div', { className: 'chips' },
+      ...(groupIndex.get(v.id) || []).map((n) => el('span', { className: 'chip group', textContent: n })),
+      ...v.lists.map((l) => el('span', { className: 'chip', textContent: l })),
+      v.status === 'Available' ? null : el('span', { className: 'chip bad', textContent: v.status }));
+    return el('div', { className: `row${state.selected.has(v.id) ? ' sel' : ''}` },
+      box, pic, el('div', {}, link, meta, chips));
+  }
+
+  /** Tick or untick one video; Shift-click does everything between it and the last click. */
+  function pick(id, on, range) {
+    let ids = [id];
+    if (range && state.lastClicked) {
+      const a = shownList.findIndex((v) => v.id === state.lastClicked);
+      const b = shownList.findIndex((v) => v.id === id);
+      if (a >= 0 && b >= 0) ids = shownList.slice(Math.min(a, b), Math.max(a, b) + 1).map((v) => v.id);
+    }
+    for (const x of ids) if (on) state.selected.add(x); else state.selected.delete(x);
+    state.lastClicked = id;
+    renderRows();
+    renderSelection();
+  }
+
+  function renderSelection() {
+    const n = state.selected.size;
+    $('selCount').textContent = n ? `${n} selected` : '';
+    $('create').disabled = !n;
+    $('create').textContent = n ? `New queue from ${plural(n, 'selected video')}` : 'New queue from selected';
+    renderGroups();
+  }
+
+  /* ---------- New queues ---------- */
+  const findGroup = (name) => state.groups.findIndex((g) => lower(g.name) === lower(name));
+  const selectedInOrder = () => state.videos.filter((v) => state.selected.has(v.id)).map((v) => v.id);
+
+  function createGroup() {
+    const name = cleanName($('newName').value);
+    if (!name) { say('Type a name for the new queue first.'); $('newName').focus(); return; }
+    if (findGroup(name) >= 0) { say(`There's already a new queue called "${name}". Use its "Add" button instead.`); return; }
+    const ids = selectedInOrder();
+    if (!ids.length) return;
+    state.groups.push({ name, ids });
+    $('newName').value = '';
+    afterGroupChange(`Made "${name}" with ${plural(ids.length, 'video')}.`);
+  }
+
+  function addToGroup(g) {
+    const have = new Set(g.ids);
+    const add = selectedInOrder().filter((id) => !have.has(id));
+    g.ids.push(...add);
+    afterGroupChange(add.length ? `Added ${plural(add.length, 'video')} to "${g.name}".` : `Those are already in "${g.name}".`);
+  }
+
+  function removeFromGroup(g) {
+    const before = g.ids.length;
+    g.ids = g.ids.filter((id) => !state.selected.has(id));
+    afterGroupChange(`Removed ${plural(before - g.ids.length, 'video')} from "${g.name}".`);
+  }
+
+  function renameGroup(g, input) {
+    const name = cleanName(input.value);
+    const clash = findGroup(name);
+    if (!name || (clash >= 0 && state.groups[clash] !== g)) {
+      say(name ? `"${name}" is already used.` : 'A new queue needs a name.');
+      input.value = g.name;
+      return;
+    }
+    const old = g.name;
+    g.name = name;
+    const chosen = state.filters.get('group');
+    if (chosen?.delete(old)) chosen.add(name);
+    afterGroupChange(old === name ? '' : `Renamed to "${name}".`);
+  }
+
+  function deleteGroup(g) {
+    state.groups = state.groups.filter((x) => x !== g);
+    state.filters.get('group')?.delete(g.name);
+    afterGroupChange(`Deleted "${g.name}". The videos are still in your queue.`);
+  }
+
+  function showOnly(g) {
+    state.filters.set('group', new Set([g.name]));
+    state.shown = PAGE;
+    render();
+  }
+
+  function afterGroupChange(message) {
+    state.selected.clear();
+    saveStore();
+    render();
+    if (message) say(message);
+  }
+
+  /** Two clicks for anything that deletes. */
+  function twoClick(button, label, action) {
+    button.addEventListener('click', () => {
+      if (button.classList.contains('armed')) { action(); return; }
+      button.classList.add('armed');
+      button.textContent = label;
+      setTimeout(() => { button.classList.remove('armed'); button.textContent = button.dataset.label; }, 4000);
+    });
+  }
+
+  function renderGroups() {
+    const sel = state.selected.size;
+    $('groups').replaceChildren(...state.groups.map((g) => {
+      const name = el('input', { type: 'text', value: g.name, maxLength: NAME_MAX });
+      name.setAttribute('aria-label', 'Rename this queue');
+      name.addEventListener('change', () => renameGroup(g, name));
+      const secs = g.ids.reduce((t, id) => t + (state.byId.get(id)?.seconds || 0), 0);
+      const inGroup = g.ids.filter((id) => state.selected.has(id)).length;
+      const add = el('button', { type: 'button', className: 'btn small', textContent: `+ Add ${sel} selected`, disabled: !sel });
+      add.addEventListener('click', () => addToGroup(g));
+      const remove = el('button', { type: 'button', className: 'btn small', textContent: `− Remove ${inGroup}`, disabled: !inGroup });
+      remove.title = 'Take the selected videos out of this new queue';
+      remove.addEventListener('click', () => removeFromGroup(g));
+      const show = el('button', { type: 'button', className: 'btn small', textContent: 'Show' });
+      show.addEventListener('click', () => showOnly(g));
+      const del = el('button', { type: 'button', className: 'btn small', textContent: 'Delete' });
+      del.dataset.label = 'Delete';
+      twoClick(del, 'Sure? Delete', () => deleteGroup(g));
+      const unavailable = g.ids.filter((id) => state.byId.get(id)?.status.startsWith('Unavailable')).length;
+      return el('div', { className: 'qcard' },
+        name,
+        el('div', { className: 'meta', textContent: `${plural(g.ids.length, 'video')}${secs ? ` · ${total(secs)}` : ''}` }),
+        g.ids.length > SAVED_MAX ? el('div', { className: 'warn', textContent: `A saved queue holds ${SAVED_MAX}; only the first ${SAVED_MAX} will be kept.` }) : null,
+        unavailable ? el('div', { className: 'warn', textContent: `${unavailable} unavailable ${unavailable === 1 ? 'video' : 'videos'} will be left out.` }) : null,
+        el('div', { className: 'btns' }, add, remove, show, del));
+    }));
+    if (!state.groups.length) $('groups').append(el('p', { className: 'muted', textContent: 'No new queues yet. Tick some videos, type a name, then click "New queue from selected".' }));
+    $('exportBox').hidden = !state.groups.some((g) => g.ids.length);
+  }
+
+  /* ---------- Download for the Queue panel ---------- */
+  /** A "saved queues only" file: the Queue panel adds these to the Saved tab and never touches your queue. */
+  function buildExport(now = Date.now()) {
+    const saved = state.groups
+      .map((g, i) => ({
+        name: g.name,
+        items: g.ids.map((id) => state.byId.get(id))
+          .filter((v) => v && !v.status.startsWith('Unavailable'))
+          .slice(0, SAVED_MAX)
+          .map((v) => ({ id: v.id, title: v.title })),
+        at: now - i, // Saved tab shows newest first, so this keeps your order
+      }))
+      .filter((q) => q.items.length);
+    return { format: BACKUP_FORMAT, version: SAVED_ONLY_VERSION, exportedAt: new Date(now).toISOString(), saved };
+  }
+
+  function download() {
+    const data = buildExport();
+    const day = new Date().toISOString().slice(0, 10);
+    const url = URL.createObjectURL(new Blob([JSON.stringify(data, null, 1)], { type: 'application/json' }));
+    const a = el('a', { href: url, download: `youtube-queue-organized-${day}.json` });
+    document.body.append(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 10000);
+    say(`Downloaded ${plural(data.saved.length, 'saved queue')}. In YouTube: Queue panel → Import → Add saved queues.`);
+  }
+
+  /* ---------- Draw everything ---------- */
+  function render() {
+    indexGroups();
+    for (const f of FACETS) renderFacet(f);
+    renderRows();
+    renderSelection();
+  }
+
+  function applyPrefs() {
+    document.documentElement.style.setProperty('--fs', `${state.prefs.fs}px`);
+    document.body.classList.toggle('no-thumbs', !state.prefs.thumbs);
+    $('thumbs').checked = state.prefs.thumbs;
+  }
+
+  /* ---------- Wiring ---------- */
+  const stored = loadStore();
+  if (stored.prefs) {
+    const fs = Number(stored.prefs.fs);
+    state.prefs = { fs: fs >= 12 && fs <= 32 ? fs : 18, thumbs: stored.prefs.thumbs !== false };
+  }
+  applyPrefs();
+
+  $('open').addEventListener('click', () => $('file').click());
+  $('file').addEventListener('change', () => { openFile($('file').files[0]); $('file').value = ''; });
+  let dragDepth = 0;
+  addEventListener('dragenter', (e) => { e.preventDefault(); dragDepth++; $('dropHint').hidden = false; });
+  addEventListener('dragleave', () => { if (--dragDepth <= 0) { dragDepth = 0; $('dropHint').hidden = true; } });
+  addEventListener('dragover', (e) => e.preventDefault());
+  addEventListener('drop', (e) => {
+    e.preventDefault();
+    dragDepth = 0;
+    $('dropHint').hidden = true;
+    openFile(e.dataTransfer?.files?.[0]);
+  });
+
+  let searchTimer;
+  $('search').addEventListener('input', () => {
+    clearTimeout(searchTimer);
+    searchTimer = setTimeout(() => { state.search = $('search').value.trim(); state.shown = PAGE; render(); }, 150);
+  });
+  $('searchDesc').addEventListener('change', () => { state.searchDesc = $('searchDesc').checked; render(); });
+  $('clearFilters').addEventListener('click', () => {
+    state.filters.clear();
+    state.search = '';
+    $('search').value = '';
+    for (const ui of facetUi.values()) if (ui.query) ui.query.value = '';
+    state.shown = PAGE;
+    render();
+  });
+  $('sort').addEventListener('change', () => { state.sort = $('sort').value; renderRows(); });
+  $('selectAll').addEventListener('click', () => { for (const v of shownList) state.selected.add(v.id); renderRows(); renderSelection(); });
+  $('selectNone').addEventListener('click', () => { state.selected.clear(); renderRows(); renderSelection(); });
+  $('more').addEventListener('click', () => { state.shown += PAGE; renderRows(); });
+  $('create').addEventListener('click', createGroup);
+  $('newName').addEventListener('keydown', (e) => { if (e.key === 'Enter' && !$('create').disabled) createGroup(); });
+  $('export').addEventListener('click', download);
+  $('startOver').dataset.label = $('startOver').textContent;
+  twoClick($('startOver'), 'Click again to delete all new queues', () => {
+    state.groups = [];
+    state.filters.delete('group');
+    afterGroupChange('Started over. Your YouTube queue is unchanged.');
+  });
+  $('thumbs').addEventListener('change', () => { state.prefs.thumbs = $('thumbs').checked; applyPrefs(); saveStore(); if (state.videos.length) renderRows(); });
+  const resize = (d) => { state.prefs.fs = Math.min(32, Math.max(12, state.prefs.fs + d)); applyPrefs(); saveStore(); };
+  $('smaller').addEventListener('click', () => resize(-2));
+  $('bigger').addEventListener('click', () => resize(2));
+
+})();
+</script>
+</body>
+</html>

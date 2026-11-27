@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         YouTube Shadow Queue
 // @namespace    local.youtube-shadow-queue
-// @version      1.2.0
+// @version      1.3.0
 // @description  Adds "Play next" / "Play last" to YouTube's ⋮ menu. Own queue, saved queues, history. Kept in Violentmonkey/Tampermonkey storage.
 // @license      MIT
 // @homepageURL  https://github.com/Claire/youtube-shadow-queue
@@ -94,7 +94,10 @@
   const EXPORT_STATUSES = ['running', 'paused', 'done', 'error'];
   const EXPORT_DELAY_MS = 1500;                 // pause between adding videos (YouTube limits fast adds)
   const BACKUP_FORMAT = 'youtube-shadow-queue-backup'; // marks our backup files
-  const BACKUP_VERSION = 1;                     // bump if the backup layout ever changes
+  const BACKUP_VERSION = 1;                     // full backups: queue + history + saved queues
+  // Saved-queues-only files (e.g. from the organizer) have no "queue" and say version 2,
+  // so older copies of this script refuse them instead of offering "Replace all".
+  const SAVED_ONLY_VERSION = 2;
   const ID_RE = /^[\w-]{11}$/;        // every YouTube video ID is 11 chars of [A-Za-z0-9_-]
   const LINK_SEL = 'a[href*="/watch?v="], a[href^="/shorts/"]';
 
@@ -293,12 +296,13 @@
     const inspect = (data) => {
       if (!data || typeof data !== 'object' || data.format !== BACKUP_FORMAT) return { ok: false, reason: 'not-a-backup' };
       if (!(Number.isInteger(data.version) && data.version >= 1)) return { ok: false, reason: 'not-a-backup' };
-      if (data.version > BACKUP_VERSION) return { ok: false, reason: 'newer' };
-      const queue = cleanState(data.queue);
+      if (data.version > SAVED_ONLY_VERSION) return { ok: false, reason: 'newer' };
+      const savedOnly = data.queue == null; // nothing to replace your queue with: only adding is allowed
+      const queue = cleanState(savedOnly ? null : data.queue);
       const saved = parseSaved(JSON.stringify(Array.isArray(data.saved) ? data.saved : []));
       const exportedAt = typeof data.exportedAt === 'string' && !Number.isNaN(Date.parse(data.exportedAt)) ? data.exportedAt : null;
       return {
-        ok: true, queue, saved, exportedAt,
+        ok: true, queue, saved, exportedAt, savedOnly,
         counts: { upNext: queue.items.length + (queue.current ? 1 : 0), played: queue.played.length, saved: saved.length },
       };
     };
@@ -464,12 +468,13 @@
       importBackup: (data, mode) => {
         const b = inspect(data);
         if (!b.ok) return b;
+        if (mode === 'replace' && b.savedOnly) return { ok: false, reason: 'saved-only' };
         if (mode === 'replace') {
           write({ ...b.queue, paused: read().paused });
           writeSaved(b.saved);
           return { ok: true, mode, ...b.counts };
         }
-        const result = { ok: true, mode, added: 0, already: 0, skipped: 0, playedAdded: 0, savedAdded: 0, savedRenamed: 0 };
+        const result = { ok: true, mode, savedOnly: b.savedOnly, added: 0, already: 0, skipped: 0, playedAdded: 0, savedAdded: 0, savedRenamed: 0 };
         update((s) => {
           const incoming = [...(b.queue.current ? [b.queue.current] : []), ...b.queue.items];
           const fresh = incoming.filter((v) => positionIn(s, v.id) < 0);
@@ -1520,11 +1525,12 @@
     importCancel.addEventListener('click', hideImport);
     const importBtns = el('div', 'sq-prompt-btns');
     importBtns.append(importCancel, ui.importReplace, ui.importMerge);
+    ui.importHelp = el('p', 'sq-prompt-p');
     ui.importBox.append(
       el('div', 'sq-prompt-h', 'Import a backup'),
       ui.importInfo,
       ui.importCounts,
-      el('p', 'sq-prompt-p', 'Merge adds what you don\'t have yet. Replace all makes everything match the backup.'),
+      ui.importHelp,
       importBtns,
     );
 
@@ -1614,7 +1620,18 @@
       ? new Date(check.exportedAt).toLocaleString([], { dateStyle: 'medium', timeStyle: 'short' })
       : 'unknown date';
     ui.importInfo.textContent = `${fileName} · ${when}`;
-    ui.importCounts.textContent = `${plural(c.upNext)} up next · ${c.played} played · ${c.saved} saved ${c.saved === 1 ? 'queue' : 'queues'}`;
+    const queues = `${c.saved} saved ${c.saved === 1 ? 'queue' : 'queues'}`;
+    if (check.savedOnly) {
+      const names = check.saved.slice(0, 4).map((q) => q.name).join(', ');
+      ui.importCounts.textContent = `${queues}: ${names}${check.saved.length > 4 ? ', …' : ''}`;
+      ui.importHelp.textContent = 'These are added to your Saved tab. Your queue and history stay as they are.';
+      ui.importMerge.textContent = 'Add saved queues';
+    } else {
+      ui.importCounts.textContent = `${plural(c.upNext)} up next · ${c.played} played · ${queues}`;
+      ui.importHelp.textContent = 'Merge adds what you don\'t have yet. Replace all makes everything match the backup.';
+      ui.importMerge.textContent = 'Merge';
+    }
+    ui.importReplace.hidden = check.savedOnly;
     ui.importReplace.textContent = 'Replace all';
     ui.importReplace.classList.remove('is-armed');
     ui.importBox.hidden = false;
@@ -1640,6 +1657,14 @@
     if (!r.ok) { toast("That backup couldn't be read."); return; }
     if (mode === 'replace') {
       toast(`Restored: ${plural(r.upNext)} up next, ${r.played} played, ${r.saved} saved queues`);
+      return;
+    }
+    if (r.savedOnly) {
+      view = 'saved'; // show what just arrived
+      render();
+      const n = r.savedAdded + r.savedRenamed;
+      toast(!n ? 'Those saved queues are already in your Saved tab.'
+        : `Added ${n} saved ${n === 1 ? 'queue' : 'queues'}${r.savedRenamed ? ` · ${r.savedRenamed} saved as "(imported)"` : ''}`);
       return;
     }
     const parts = [`Added ${plural(r.added)}`];
